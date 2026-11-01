@@ -95,16 +95,23 @@ impl Ci {
         if !jobs.ok() {
             return Err((jobs.code, format!("job list: {}", jobs.message())));
         }
-        if let Some(j) = jobs.data()["jobs"].as_array().into_iter().flatten().find(|j| {
-            j["kind"] == "active-scan" && matches!(j["state"].as_str(), Some("running" | "stopping" | "queued"))
-        }) {
-            return Err((
-                code::USAGE,
-                format!(
-                    "job {} is still {} in this project; wait for it or `job stop {}`",
-                    j["id"], j["state"], j["id"]
-                ),
-            ));
+        let busy = |state: &Value| matches!(state.as_str(), Some("running" | "stopping" | "queued"));
+        for j in jobs.data()["jobs"].as_array().into_iter().flatten() {
+            if j["kind"] != "active-scan" || !busy(&j["state"]) {
+                continue;
+            }
+            // `job list` can still say running for a scan whose process died; `job status` checks.
+            let id = j["id"].as_u64().unwrap_or(0);
+            let status = call(&cli, ["job".into(), "status".into(), id.to_string()]).await?;
+            if status.ok() && busy(&status.data()["state"]) {
+                return Err((
+                    code::USAGE,
+                    format!(
+                        "job {id} is still {} in this project; wait for it or `job stop {id}`",
+                        status.data()["state"].as_str().unwrap_or("?")
+                    ),
+                ));
+            }
         }
 
         let history = record::history(&args.out).map_err(|e| (code::ERROR, format!("reading the run history: {e}")))?;

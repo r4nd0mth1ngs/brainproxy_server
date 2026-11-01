@@ -528,3 +528,22 @@ fn kill(pid: u32, signal: &str) {
     let ok = Command::new("kill").arg(signal).arg(pid.to_string()).status().unwrap().success();
     assert!(ok, "kill {signal} {pid}");
 }
+
+#[test]
+fn a_live_scan_in_the_project_is_refused_and_a_dead_one_is_not() {
+    let Some(env) = Env::new() else { return };
+    let app = App::start(20);
+    app.state.delay_ms.store(150, Ordering::SeqCst);
+    env.engage(&app);
+    let r = env.brainproxy(&["scan", "active", &app.url(), "--crawl", "--preset", "quick", "--background"]);
+    assert_eq!(r["ok"], true, "{r}");
+    let pid = wait_for_running_job(&env);
+    let (code, _) = env.ci(&app.url(), &[]);
+    assert_eq!(code, 2, "ran beside a live scan");
+
+    kill(pid, "-KILL");
+    std::thread::sleep(Duration::from_millis(300));
+    app.state.delay_ms.store(0, Ordering::SeqCst);
+    let (code, run) = env.ci(&app.url(), &[]);
+    assert_eq!(code, 0, "refused because of a dead scan: {run}");
+}
