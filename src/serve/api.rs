@@ -246,9 +246,9 @@ fn authenticate(
     if !t.perm.allows(need) {
         return Err(ApiError::forbidden("this token is read-only"));
     }
-    let bucket = if need == Perm::Trigger { Bucket::Trigger } else { Bucket::Read };
-    if !s.limits.take(bucket, &t.id) {
-        return Err(ApiError::too_many(format!("too many {} requests for this token; try again later", need.name())));
+    // Triggers also take from their own, smaller bucket (in `trigger`).
+    if !s.limits.take(Bucket::Read, &t.id) {
+        return Err(ApiError::too_many("too many requests for this token; try again later"));
     }
     Ok(Caller::Token(t))
 }
@@ -518,6 +518,11 @@ async fn trigger(
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
     let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Trigger)?;
+    if let Caller::Token(tok) = &caller
+        && !app.server.limits.take(Bucket::Trigger, &tok.id)
+    {
+        return Err(ApiError::too_many("this token triggered 10 runs in the last hour; try again later"));
+    }
     let target = load_target(&app, &t)?;
     let b: TriggerBody = parse_body(&body)?;
     for (name, v) in [("commit", &b.commit), ("ref", &b.git_ref)] {
@@ -570,14 +575,23 @@ async fn trigger(
         v["deduplicated_by"] = json!(why);
         ok(StatusCode::OK, v)
     };
-    if let Some(k) = &key
-        && let Some(id) = s.db().idempotent_run(&owner, k, now - DEDUP_MS).map_err(ApiError::db)?
-        && let Some(row) = s.db().run(&t, &id).map_err(ApiError::db)?
-    {
-        return dedup(row, "idempotency_key");
+    // Each lookup binds its result first: a `MutexGuard` in an `if let` would live through the
+    // body, and `dedup` locks the database again.
+    let by_key = match &key {
+        Some(k) => s.db().idempotent_run(&owner, k, now - DEDUP_MS).map_err(ApiError::db)?,
+        None => None,
+    };
+    if let Some(id) = by_key {
+        let row = s.db().run(&t, &id).map_err(ApiError::db)?;
+        if let Some(row) = row {
+            return dedup(row, "idempotency_key");
+        }
     }
-    if let Some(c) = &b.commit
-        && let Some(row) = s.db().run_for_commit(&t, c, now - DEDUP_MS).map_err(ApiError::db)?
+    let by_commit = match &b.commit {
+        Some(c) => s.db().run_for_commit(&t, c, now - DEDUP_MS).map_err(ApiError::db)?,
+        None => None,
+    };
+    if let Some(row) = by_commit
         && (state::is_live(&row.state) || !b.force)
     {
         return dedup(row, "commit");
@@ -610,9 +624,11 @@ async fn trigger(
         Ok(sup) => sup,
         Err(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
             // A racing trigger of the same commit won: answer with its run.
-            if let Some(c) = &b.commit
-                && let Some(won) = s.db().run_for_commit(&t, c, now - DEDUP_MS).map_err(ApiError::db)?
-            {
+            let won = match &b.commit {
+                Some(c) => s.db().run_for_commit(&t, c, now - DEDUP_MS).map_err(ApiError::db)?,
+                None => None,
+            };
+            if let Some(won) = won {
                 return dedup(won, "commit");
             }
             return Err(ApiError::conflict("another trigger for this target won the race; try again"));

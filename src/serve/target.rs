@@ -66,6 +66,9 @@ pub struct AuthSpec {
     pub login_url: Option<String>,
     pub login_method: Option<String>,
     pub login_body: Option<String>,
+    /// Headers for the login request only ("Name: value"), e.g. a form body's Content-Type.
+    #[serde(default)]
+    pub login_header: Vec<String>,
     pub username: Option<String>,
     pub password_env: Option<String>,
     pub csrf_url: Option<String>,
@@ -99,6 +102,9 @@ impl AuthSpec {
             if let Some(value) = value {
                 v.push(format!("--{flag}={value}"));
             }
+        }
+        for h in &self.login_header {
+            v.push(format!("--login-header={h}"));
         }
         v
     }
@@ -233,7 +239,10 @@ impl TargetConfig {
                 &a.logged_out,
                 &a.check_url,
             ];
-            if texts.iter().flat_map(|t| t.as_deref()).any(|t| t.len() > 4096 || t.contains('\0')) {
+            let headers = a.login_header.iter().map(String::as_str);
+            if texts.iter().flat_map(|t| t.as_deref()).chain(headers).any(|t| t.len() > 4096 || t.contains('\0'))
+                || a.login_header.len() > 16
+            {
                 return Err("auth values must be under 4 KB".into());
             }
             if let Some(var) = &a.password_env
@@ -523,6 +532,7 @@ mod tests {
             login_url: Some("https://shop.test/login".into()),
             login_method: None,
             login_body: Some("-x".into()),
+            login_header: vec![],
             username: Some("ci".into()),
             password_env: Some("APP_PW".into()),
             csrf_url: None,
