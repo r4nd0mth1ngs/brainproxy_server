@@ -1,8 +1,11 @@
-//! `brainproxy-server ci`: one scan of one target, compared with the previous runs, gated, and
-//! written to a run folder. The steps are in PLAN.md (phase 1); the outcome rules are research §7.3.
+//! One scan of one target, compared with the previous runs, gated, and written to a run folder: the
+//! `ci` command, and each run of `serve` (see [`Ci::start`] and [`Ci::resume`]). The steps are in
+//! PLAN.md (phase 1); the outcome rules are research §7.3.
 
+use std::ffi::OsString;
 use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::watch;
@@ -33,16 +36,43 @@ pub struct Args {
     pub new_only: bool,
     pub out: PathBuf,
     pub max_minutes: Option<u64>,
+    /// `scan active --rate`: requests per second.
+    pub rate: Option<u32>,
     pub auth: Option<String>,
     pub accept_coverage_drop: bool,
     pub baseline: bool,
 }
 
+pub type OnWrite = Arc<dyn Fn(&Run) + Send + Sync>;
+
+/// How a run differs when `serve` runs it rather than the `ci` command.
+#[derive(Clone, Default)]
+pub struct Options {
+    /// The run folder. `None`: `<out>/<job start time>-<job>/`, named once the job has started.
+    pub folder: Option<PathBuf>,
+    /// The whole environment of the CLI processes; `None` inherits this process's.
+    pub env: Option<Arc<Vec<(OsString, OsString)>>>,
+    /// Called with `run.json` each time it is written.
+    pub on_write: Option<OnWrite>,
+    /// Starts each progress line on stderr (default `brainproxy-server`).
+    pub label: Option<String>,
+}
+
+/// A finished run: its `run.json` and exit code.
+pub struct Finished {
+    pub run: Run,
+    pub exit: i32,
+}
+
 /// Runs `ci` and returns the exit code. Progress and the summary go to stderr, `run.json` to stdout.
 pub async fn run(args: Args) -> i32 {
     let cancel = cancel_signal();
-    match Ci::start(args).await {
-        Ok(ci) => ci.finish(cancel).await,
+    match Ci::start(args, Options::default()).await {
+        Ok(ci) => {
+            let done = ci.finish(cancel).await;
+            println!("{}", serde_json::to_string_pretty(&done.run).unwrap_or_default());
+            done.exit
+        }
         Err((code, message)) => {
             eprintln!("brainproxy-server: {message}");
             code
@@ -51,22 +81,31 @@ pub async fn run(args: Args) -> i32 {
 }
 
 /// Everything known before the scan starts.
-struct Ci {
+pub struct Ci {
     args: Args,
+    opts: Options,
     cli: Cli,
     _lock: File,
     run: Run,
     history: Vec<record::Past>,
     /// The signal that cancelled the run, once one has.
     cancelled: Option<&'static str>,
+    /// Set by [`Ci::resume`]: the job is already running.
+    resumed: bool,
 }
 
-type Refusal = (i32, String);
+pub type Refusal = (i32, String);
 
 impl Ci {
     /// Checks the CLI, the project and the run folder, and takes the lock. Nothing is written yet.
-    async fn start(mut args: Args) -> Result<Ci, Refusal> {
-        let version = brainproxy::check_version(&args.brainproxy).await.map_err(|e| (code::ERROR, e))?;
+    pub async fn start(args: Args, opts: Options) -> Result<Ci, Refusal> {
+        Ci::prepare(args, opts, true).await
+    }
+
+    /// [`Ci::start`]; `refuse_busy`: refuse a project with a live scan.
+    async fn prepare(mut args: Args, opts: Options, refuse_busy: bool) -> Result<Ci, Refusal> {
+        let version =
+            brainproxy::check_version(&args.brainproxy, opts.env.as_deref()).await.map_err(|e| (code::ERROR, e))?;
 
         // `--project` creates a missing file, so check first: never scan into a new, empty project.
         if !args.project.is_file() {
@@ -79,7 +118,7 @@ impl Ci {
             ));
         }
         args.project = args.project.canonicalize().map_err(|e| (code::ERROR, format!("project: {e}")))?;
-        let cli = Cli { bin: args.brainproxy.clone(), project: args.project.clone() };
+        let cli = Cli { bin: args.brainproxy.clone(), project: args.project.clone(), env: opts.env.clone() };
 
         let eng = call(&cli, ["engagement", "show"]).await?;
         if !eng.ok() {
@@ -102,7 +141,7 @@ impl Ci {
             return Err((jobs.code, format!("job list: {}", jobs.message())));
         }
         let busy = |state: &Value| matches!(state.as_str(), Some("running" | "stopping" | "queued"));
-        for j in jobs.data()["jobs"].as_array().into_iter().flatten() {
+        for j in jobs.data()["jobs"].as_array().into_iter().flatten().filter(|_| refuse_busy) {
             if j["kind"] != "active-scan" || !busy(&j["state"]) {
                 continue;
             }
@@ -132,6 +171,7 @@ impl Ci {
             new_only: args.new_only,
             auth: args.auth.clone(),
             max_minutes: args.max_minutes,
+            rate: args.rate,
             started_at: time::now(),
             finished_at: None,
             job: None,
@@ -147,54 +187,48 @@ impl Ci {
             baseline: args.baseline,
             folder: None,
         };
-        Ok(Ci { args, cli, _lock: lock, run, history, cancelled: None })
+        Ok(Ci { args, opts, cli, _lock: lock, run, history, cancelled: None, resumed: false })
+    }
+
+    /// Picks up a run whose `run.json` (in `opts.folder`) says its job started, after `serve` was
+    /// restarted: [`Ci::finish`] then waits for that job instead of starting a scan. `Err` when the
+    /// run can't be resumed; the caller then ends it as incomplete.
+    pub async fn resume(args: Args, opts: Options) -> Result<Ci, Refusal> {
+        let folder = opts.folder.clone().ok_or((code::ERROR, "no run folder to resume".to_string()))?;
+        let text = std::fs::read_to_string(folder.join(record::RUN_FILE))
+            .map_err(|e| (code::USAGE, format!("can't read {}: {e}", folder.join(record::RUN_FILE).display())))?;
+        let run: Run = serde_json::from_str(&text).map_err(|e| (code::ERROR, format!("run.json: {e}")))?;
+        if run.job.is_none() || run.outcome != Outcome::Running {
+            return Err((code::USAGE, "the run's scan hadn't started".into()));
+        }
+        let mut ci = Ci::prepare(args, opts, false).await?;
+        ci.run = Run { reasons: run.reasons.clone(), ..run };
+        ci.run.reasons.push("the server restarted during the scan; it waited for the scan again".into());
+        ci.resumed = true;
+        Ok(ci)
     }
 
     /// Runs the scan and everything after it. Every path from here writes `run.json`.
-    async fn finish(mut self, mut cancel: watch::Receiver<Option<&'static str>>) -> i32 {
+    pub async fn finish(mut self, mut cancel: watch::Receiver<Option<&'static str>>) -> Finished {
         let folder = match self.scan(&mut cancel).await {
             Ok(folder) => folder,
             Err((outcome, code, reason)) => {
                 self.run.reasons.push(reason);
                 let folder = self.folder(None);
-                return self.done(&folder, outcome, code);
+                return self.done(folder, outcome, code);
             }
         };
         let (outcome, code) = self.judge(&folder).await;
-        self.done(&folder, outcome, code)
+        self.done(folder, outcome, code)
     }
 
     /// Login check, scan, wait. Returns the run folder once the job has finished.
     async fn scan(&mut self, cancel: &mut watch::Receiver<Option<&'static str>>) -> Result<PathBuf, Stop> {
-        self.pick_since_scan().await?;
-        self.pick_coverage_baseline();
-        if let Some(name) = self.args.auth.clone() {
-            self.check_login(&name).await?;
-        }
-        if let Some(sig) = *cancel.borrow() {
-            return Err((Outcome::Incomplete, code::USAGE, format!("cancelled by {sig} before the scan started")));
-        }
-
-        let mut argv: Vec<String> =
-            ["scan", "active", &self.args.url, "--crawl", "--preset", &self.args.preset].map(String::from).to_vec();
-        if let Some(m) = self.args.max_minutes {
-            argv.extend(["--max-minutes".into(), m.to_string()]);
-        }
-        if let Some(a) = &self.args.auth {
-            argv.extend(["--auth".into(), a.clone()]);
-        }
-        argv.push("--background".into());
-        let started = call(&self.cli, &argv).await.map_err(stop_error)?;
-        let Some(id) = started.data()["job"].as_u64().filter(|_| started.ok()) else {
-            return Err((Outcome::Error, nonzero(started.code), format!("scan active: {}", started.message())));
+        let id = match &self.run.job {
+            Some(job) if self.resumed => job.id,
+            _ => self.start_scan(cancel).await?,
         };
-
-        let status = call(&self.cli, ["job".into(), "status".into(), id.to_string()]).await.map_err(stop_error)?;
-        self.run.job = Some(job_from(id, status.data()));
         let folder = self.folder(Some(id));
-        let _ = self.write(&folder);
-        eprintln!("brainproxy-server: job {id} started, run folder {}", folder.display());
-
         let status = self.wait(id, &folder, cancel).await;
         self.run.job = Some(job_from(id, status.data()));
         let result = &status.data()["result"];
@@ -209,6 +243,46 @@ impl Ci {
             });
         }
         Ok(folder)
+    }
+
+    /// Login check and `scan active --background`. Returns the job id once `run.json` records it.
+    async fn start_scan(&mut self, cancel: &mut watch::Receiver<Option<&'static str>>) -> Result<u64, Stop> {
+        self.pick_since_scan().await?;
+        self.pick_coverage_baseline();
+        if let Some(name) = self.args.auth.clone() {
+            self.check_login(&name).await?;
+        }
+        if let Some(sig) = *cancel.borrow() {
+            return Err((Outcome::Incomplete, code::USAGE, format!("cancelled by {sig} before the scan started")));
+        }
+
+        let mut argv: Vec<String> =
+            ["scan", "active", &self.args.url, "--crawl", "--preset", &self.args.preset].map(String::from).to_vec();
+        if let Some(m) = self.args.max_minutes {
+            argv.extend(["--max-minutes".into(), m.to_string()]);
+        }
+        if let Some(r) = self.args.rate {
+            argv.extend(["--rate".into(), r.to_string()]);
+        }
+        if let Some(a) = &self.args.auth {
+            argv.extend(["--auth".into(), a.clone()]);
+        }
+        argv.push("--background".into());
+        let started = call(&self.cli, &argv).await.map_err(stop_error)?;
+        let Some(id) = started.data()["job"].as_u64().filter(|_| started.ok()) else {
+            return Err((Outcome::Error, nonzero(started.code), format!("scan active: {}", started.message())));
+        };
+
+        let status = call(&self.cli, ["job".into(), "status".into(), id.to_string()]).await.map_err(stop_error)?;
+        self.run.job = Some(job_from(id, status.data()));
+        let folder = self.folder(Some(id));
+        let _ = self.write(&folder);
+        self.log(format!("job {id} started, run folder {}", folder.display()));
+        Ok(id)
+    }
+
+    fn log(&self, line: String) {
+        eprintln!("{}: {line}", self.opts.label.as_deref().unwrap_or("brainproxy-server"));
     }
 
     /// `job wait` in steps until the job is finished, stopping it on a cancel or when waiting keeps
@@ -227,11 +301,11 @@ impl Ci {
                         return out;
                     }
                     failures = 0;
-                    eprintln!(
-                        "brainproxy-server: job {id} {}: {}",
+                    self.log(format!(
+                        "job {id} {}: {}",
                         out.data()["state"].as_str().unwrap_or("?"),
                         compact(&out.data()["progress"])
-                    );
+                    ));
                     continue;
                 }
                 Ok(out) => out.message(),
@@ -241,7 +315,7 @@ impl Ci {
                 return self.cancel(id, folder, cancel).await;
             }
             failures += 1;
-            eprintln!("brainproxy-server: job wait {id} failed ({failures}/{WAIT_RETRIES}): {failed}");
+            self.log(format!("job wait {id} failed ({failures}/{WAIT_RETRIES}): {failed}"));
             if failures >= WAIT_RETRIES {
                 self.run.reasons.push(format!("job wait {id} kept failing ({failed}); the job was asked to stop"));
                 let _ = call(&self.cli, ["job".into(), "stop".into(), id.to_string()]).await;
@@ -260,7 +334,7 @@ impl Ci {
     async fn cancel(&mut self, id: u64, folder: &Path, cancel: &mut watch::Receiver<Option<&'static str>>) -> Output {
         let sig = cancel.borrow_and_update().unwrap_or("a signal");
         self.cancelled = Some(sig);
-        eprintln!("brainproxy-server: {sig}: stopping job {id}");
+        self.log(format!("{sig}: stopping job {id}"));
         self.run.reasons.push(format!("cancelled by {sig}; job {id} was asked to stop"));
         let _ = call(&self.cli, ["job".into(), "stop".into(), id.to_string()]).await;
         self.run.outcome = Outcome::Incomplete;
@@ -496,8 +570,15 @@ impl Ci {
         }
     }
 
-    /// `DIR/<time>-<job>/`, created. A second run without a job in the same second gets a suffix.
+    /// `DIR/<time>-<job>/` (or the fixed folder), created. A second run without a job in the same
+    /// second gets a suffix.
     fn folder(&self, job: Option<u64>) -> PathBuf {
+        if let Some(path) = &self.opts.folder {
+            if let Err(e) = std::fs::create_dir_all(path) {
+                self.log(format!("can't create {}: {e}", path.display()));
+            }
+            return path.clone();
+        }
         let start = match self.run.job.as_ref() {
             Some(j) if !j.time.is_empty() => j.time.as_str(),
             _ => self.run.started_at.as_str(),
@@ -510,29 +591,28 @@ impl Ci {
             path = self.args.out.join(format!("{base}.{n}"));
         }
         if let Err(e) = std::fs::create_dir_all(&path) {
-            eprintln!("brainproxy-server: can't create {}: {e}", path.display());
+            self.log(format!("can't create {}: {e}", path.display()));
         }
         path
     }
 
-    fn done(&mut self, folder: &Path, outcome: Outcome, exit: i32) -> i32 {
+    fn done(mut self, folder: PathBuf, outcome: Outcome, exit: i32) -> Finished {
         self.run.outcome = outcome;
         self.run.exit_code = Some(exit);
         self.run.finished_at = Some(time::now());
-        self.run.folder = Some(folder.to_path_buf());
+        self.run.folder = Some(folder.clone());
         let mut exit = exit;
-        if !self.write(folder) && exit == code::OK {
+        if !self.write(&folder) && exit == code::OK {
             // A pass that can't be recorded would drop out of the history; don't call it one.
             self.run.outcome = Outcome::Error;
             self.run.exit_code = Some(code::ERROR);
             exit = code::ERROR;
         }
-        eprintln!("brainproxy-server: {}", summary_line(&self.run, folder));
+        self.log(summary_line(&self.run, &folder));
         for r in &self.run.reasons {
             eprintln!("  - {r}");
         }
-        println!("{}", serde_json::to_string_pretty(&self.run).unwrap_or_default());
-        exit
+        Finished { run: self.run, exit }
     }
 
     /// Writes `run.json` (through a temporary file, so a reader never sees half of it).
@@ -540,9 +620,14 @@ impl Ci {
         let text = serde_json::to_vec_pretty(&self.run).unwrap_or_default();
         let tmp = folder.join(".run.json.tmp");
         match std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, folder.join(record::RUN_FILE))) {
-            Ok(()) => true,
+            Ok(()) => {
+                if let Some(f) = &self.opts.on_write {
+                    f(&self.run);
+                }
+                true
+            }
             Err(e) => {
-                eprintln!("brainproxy-server: can't write {}: {e}", folder.join(record::RUN_FILE).display());
+                self.log(format!("can't write {}: {e}", folder.join(record::RUN_FILE).display()));
                 false
             }
         }
@@ -572,7 +657,7 @@ fn stop_error((code, message): Refusal) -> Stop {
 async fn call<I, S>(cli: &Cli, args: I) -> Result<Output, Refusal>
 where
     I: IntoIterator<Item = S>,
-    S: Into<std::ffi::OsString>,
+    S: Into<OsString>,
 {
     cli.run(args).await.map_err(|e| (code::ERROR, format!("can't run {}: {e}", cli.bin.display())))
 }

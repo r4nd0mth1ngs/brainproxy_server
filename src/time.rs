@@ -3,8 +3,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now() -> String {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-    format_millis(d.as_millis() as i64)
+    format_millis(now_millis())
+}
+
+/// Milliseconds since the epoch.
+pub fn now_millis() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64
 }
 
 /// Milliseconds since the epoch → RFC 3339 UTC with milliseconds.

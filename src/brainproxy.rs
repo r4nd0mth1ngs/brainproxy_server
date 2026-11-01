@@ -7,6 +7,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::process::Command;
@@ -60,6 +61,8 @@ impl Output {
 pub struct Cli {
     pub bin: PathBuf,
     pub project: PathBuf,
+    /// The CLI's whole environment; `None` inherits this process's.
+    pub env: Option<Arc<Vec<(OsString, OsString)>>>,
 }
 
 impl Cli {
@@ -72,7 +75,15 @@ impl Cli {
         let mut cmd = Command::new(&self.bin);
         cmd.arg("--project").arg(&self.project).arg("--format").arg("json");
         cmd.args(args.into_iter().map(Into::into));
+        set_env(&mut cmd, self.env.as_deref());
         run(cmd).await
+    }
+}
+
+/// Replaces the command's environment with `env`, when given.
+pub fn set_env(cmd: &mut Command, env: Option<&Vec<(OsString, OsString)>>) {
+    if let Some(env) = env {
+        cmd.env_clear().envs(env.iter().map(|(k, v)| (k, v)));
     }
 }
 
@@ -93,9 +104,10 @@ pub async fn run(mut cmd: Command) -> std::io::Result<Output> {
 }
 
 /// The CLI's version from `capabilities`, checked against [`MIN_VERSION`].
-pub async fn check_version(bin: &Path) -> Result<String, String> {
+pub async fn check_version(bin: &Path, env: Option<&Vec<(OsString, OsString)>>) -> Result<String, String> {
     let mut cmd = Command::new(bin);
     cmd.args(["--format", "json", "capabilities"]);
+    set_env(&mut cmd, env);
     let out = run(cmd).await.map_err(|e| format!("can't run {}: {e}", bin.display()))?;
     let version = out.data()["version"]
         .as_str()

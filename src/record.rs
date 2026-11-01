@@ -91,6 +91,8 @@ pub struct Run {
     pub new_only: bool,
     pub auth: Option<String>,
     pub max_minutes: Option<u64>,
+    #[serde(default)]
+    pub rate: Option<u32>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub job: Option<Job>,
@@ -230,6 +232,7 @@ mod tests {
             new_only: false,
             auth: None,
             max_minutes: None,
+            rate: None,
             started_at: String::new(),
             finished_at: None,
             job: Some(Job { id: job, time: format!("t{job}"), ..Job::default() }),
