@@ -661,6 +661,11 @@ fn remote_run_exit_codes_drift_and_reports() {
     assert_eq!(code, 0, "{r3}");
     let (_, latest) = s.get_public("/v1/targets/shop/latest", Some(&tok));
     assert_eq!(latest["data"]["run"], r3["run"]);
+    // Even the same token sending a finished run's commit gets a new scan: the commit is a label,
+    // and that run tested what was deployed then.
+    let (status, v) = s.trigger("shop", &tok, json!({"commit": "c3"}));
+    assert_eq!(status, 202, "a finished run was reused for its commit: {v}");
+    s.wait_run("shop", &run_id(&v), &tok);
 
     // 4: the app lost most of its pages: coverage dropped, incomplete (2), never a pass.
     app.state.pages.store(0, Ordering::SeqCst);

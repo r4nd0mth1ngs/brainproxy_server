@@ -41,7 +41,7 @@ jobs:
           echo "##vso[task.prependpath]$(Agent.TempDirectory)/bps/bin"
         displayName: brainproxy-server
 
-      # A run of the same commit within 24 hours is answered with that run (add --force to scan anyway).
+      # Each invocation scans the deploy that is live now; a re-run scans again.
       - script: |
           brainproxy-server remote run --server "$(scanServer)" --target "$(scanTarget)" \
             --commit "$(Build.SourceVersion)" --ref "$(Build.SourceBranch)" \

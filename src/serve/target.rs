@@ -437,6 +437,10 @@ pub fn check_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
             if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
                 return check_ip(IpAddr::V4(embedded(&seg)), allow_loopback);
             }
+            // Other translation prefixes (6to4, local-use NAT64, SIIT) reach IPv4 through a gateway.
+            if seg[0] == 0x2002 || seg[..3] == [0x64, 0xff9b, 1] || seg[..6] == [0, 0, 0, 0, 0xffff, 0] {
+                return Err("IPv6 translation addresses (6to4, NAT64, SIIT) can't be targets".into());
+            }
             // The deprecated IPv4-compatible form (::a.b.c.d); nothing should use it.
             if seg[..6] == [0; 6] && !a.is_loopback() && !a.is_unspecified() {
                 return Err("IPv4-compatible IPv6 addresses can't be targets".into());
@@ -530,6 +534,9 @@ mod tests {
             "[64:ff9b::7f00:1]",
             "[64:ff9b::a9fe:a9fe]",
             "[::7f00:1]",
+            "[2002:a9fe:a9fe::1]",
+            "[64:ff9b:1::a9fe:a9fe]",
+            "[::ffff:0:a9fe:a9fe]",
             "100.100.100.200",
             "100.100.100.0/24",
             "0.0.0.0",

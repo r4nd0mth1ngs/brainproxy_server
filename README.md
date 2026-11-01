@@ -102,8 +102,10 @@ and gate); a pipeline then only names the target and gets a verdict.
   Every CLI process gets a cleared environment with a small allowlist plus its own target's secrets.
 - **Queue.** One running and one queued run per target, at most `--max-parallel` (3) scans. A newer
   trigger replaces the queued run, which ends as `superseded`. A trigger from the same token with the
-  same `commit` and preset within 24 hours, or the same `Idempotency-Key`, returns the existing run
-  (never another token's run, and never a baseline run: a commit is only a label the caller chose). A restart waits for
+  same `commit` and preset while that run is still queued returns it; a finished run is never
+  reused for a commit (a commit is only a label the caller chose, and the run tested whatever was
+  deployed then). The same `Idempotency-Key` from the same token returns its run for 24 hours;
+  `remote` sends a fresh random key per invocation. A restart waits for
   running scans again (in a container a restart also ends them: those runs end incomplete).
 - **Outcome rules** are those of `ci`: anything cut short, cancelled, superseded, with a broken
   login or collapsed coverage is incomplete (exit 2), never a pass; so is a run cancelled after its
@@ -151,7 +153,7 @@ lists, and no profile stores a password in the file.
 | `POST /v1/targets/{t}/next-run` | admin | `{"baseline": true}` or `{"accept_coverage_drop": true}` for the next run only |
 | `GET /v1/summary`, `GET /v1/audit` | admin | Counts and last runs per target; the audit log |
 | `GET /v1/targets`, `GET /v1/targets/{t}` | token (own target) or admin | Configuration, without secret sources |
-| `POST /v1/targets/{t}/runs` | trigger token | `{"commit", "ref", "pipeline_url", "preset", "force"}`, all optional |
+| `POST /v1/targets/{t}/runs` | trigger token | `{"commit", "ref", "pipeline_url", "preset"}`, all optional |
 | `GET /v1/targets/{t}/runs`, `.../runs/{r}?wait=60` | token | List runs; a run's status, long-polled |
 | `POST /v1/targets/{t}/runs/{r}/cancel` | trigger token | Cancel (stops the scan) |
 | `GET .../runs/{r}/drift` | token | New, unchanged and fixed findings and the gate (`findings compare`) |

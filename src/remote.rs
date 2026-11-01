@@ -26,7 +26,6 @@ pub struct Args {
     pub git_ref: Option<String>,
     pub pipeline_url: Option<String>,
     pub preset: Option<String>,
-    pub force: bool,
     pub idempotency_key: Option<String>,
     pub timeout: Duration,
     pub detach: bool,
@@ -176,13 +175,14 @@ pub fn run(args: Args) -> i32 {
             body.insert(k.into(), json!(v));
         }
     }
-    if args.force {
-        body.insert("force".into(), json!(true));
-    }
     // Without a commit, a key per invocation still makes a retried POST start one run, not two.
-    let key = args.idempotency_key.clone().or_else(|| {
-        args.commit.is_none().then(|| crate::serve::auth::base32(&crate::serve::auth::random_bytes::<16>()))
-    });
+    // A fresh key per invocation: a retried POST starts one run, not two, and no other caller can
+    // guess it to be answered with this run.
+    let key = Some(
+        args.idempotency_key
+            .clone()
+            .unwrap_or_else(|| crate::serve::auth::base32(&crate::serve::auth::random_bytes::<16>())),
+    );
     let url = client.target_path(&args.target, "/runs");
     let answer = match client.send_retrying("POST", &url, Some(&Value::Object(body)), key.as_deref()) {
         Ok(a) => a,
@@ -197,7 +197,7 @@ pub fn run(args: Args) -> i32 {
     };
     if data["deduplicated"] == true {
         eprintln!(
-            "brainproxy-server: run {run} ({}) already exists for this {}",
+            "brainproxy-server: run {run} ({}) is already queued for this {}",
             data["state"].as_str().unwrap_or("?"),
             if data["deduplicated_by"] == "commit" { "commit" } else { "idempotency key" }
         );

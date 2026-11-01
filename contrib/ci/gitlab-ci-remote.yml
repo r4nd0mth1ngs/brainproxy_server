@@ -34,7 +34,7 @@ dast:
   script:
     - cargo install --locked --root "$CI_PROJECT_DIR/.bps"
         --git https://github.com/r4nd0mth1ngs/brainproxy_server --rev "$SERVER_REF" brainproxy-server
-    # A run of the same commit within 24 hours is answered with that run (add --force to scan anyway).
+    # Each invocation scans the deploy that is live now; a re-run scans again.
     - .bps/bin/brainproxy-server remote run --server "$SCAN_SERVER" --target "$SCAN_TARGET"
         --commit "$CI_COMMIT_SHA" --ref "$CI_COMMIT_REF_NAME" --pipeline-url "$CI_PIPELINE_URL"
         --sarif brainproxy.sarif --report brainproxy.html

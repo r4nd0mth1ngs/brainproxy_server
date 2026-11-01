@@ -57,7 +57,7 @@ pub struct Config {
     pub trust_forwarded: bool,
 }
 
-/// How long a commit's completed run, and an `Idempotency-Key`, answer a repeated trigger.
+/// How long an `Idempotency-Key` answers a repeated trigger with its run.
 pub const DEDUP_MS: i64 = 24 * 3600 * 1000;
 
 /// The live run of one worker: its target, and the sender that cancels it.
@@ -360,11 +360,26 @@ impl Server {
             // A cancelled run never passes, even when its scan completed before the cancel reached it
             // (the same rule as `ci`).
             let end = if cancelled {
+                let mut run = end.run;
                 let note = match end.state {
-                    state::COMPLETED => Some("cancelled after the scan completed; not counted as a pass".to_string()),
+                    state::COMPLETED => {
+                        // Also in run.json, which the next run's history reads: not a pass to count from.
+                        if let Some(r) = run.as_mut() {
+                            r["outcome"] = json!("incomplete");
+                            r["exit_code"] = json!(code::USAGE);
+                            if let Some(reasons) = r["reasons"].as_array_mut() {
+                                reasons.push(json!("cancelled after the scan completed"));
+                            }
+                            let path = self.run_dir(&target, &id).join(crate::record::RUN_FILE);
+                            if let Err(e) = write_atomic(&path, &serde_json::to_vec_pretty(r).unwrap_or_default()) {
+                                eprintln!("brainproxy-server: rewriting {}: {e}", path.display());
+                            }
+                        }
+                        Some("cancelled after the scan completed; not counted as a pass".to_string())
+                    }
                     _ => end.note,
                 };
-                End { state: state::CANCELLED, outcome: "incomplete", exit: code::USAGE, note, ..end }
+                End { state: state::CANCELLED, outcome: "incomplete", exit: code::USAGE, note, run }
             } else {
                 end
             };
@@ -617,13 +632,9 @@ impl Server {
     /// research §5.3. The file's folder is removed either way.
     pub async fn accept_upload(&self, id: &str, file: &Path) -> Result<Value, ApiError> {
         let _op = self.admin_ops.lock().await;
-        let result = self.accept_upload_locked(id, file).await;
-        if let Some(dir) = file.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-        self.busy.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-        self.wake.notify_one();
-        result
+        // Released however this ends, also when the client goes away and the handler is dropped.
+        let _busy = Busy { server: self, id };
+        self.accept_upload_locked(id, file).await
     }
 
     async fn accept_upload_locked(&self, id: &str, file: &Path) -> Result<Value, ApiError> {
@@ -663,10 +674,17 @@ impl Server {
         // the scan somewhere the registration never named.
         let conn = cli_ok(&cli, ["connection", "show"]).await?;
         let c = conn.data();
-        if c["upstream"].as_array().is_some_and(|u| !u.is_empty()) {
-            return Err(ApiError::invalid(
-                "the project has upstream proxies (`connection upstream`); the server doesn't accept those",
-            ));
+        // An allowlist: host overrides (checked below) and nothing else, including keys a later CLI
+        // may add. Client certificates are file paths read on the server, which could name another
+        // target's secret files.
+        for (key, value) in c.as_object().into_iter().flatten() {
+            let empty = value.as_array().is_some_and(Vec::is_empty);
+            if !matches!(key.as_str(), "hosts" | "warnings" | "note") && !empty && !value.is_null() {
+                return Err(ApiError::invalid(format!(
+                    "the project has connection settings the server doesn't accept (`connection {key}`); \
+                     only host overrides to addresses in the scope"
+                )));
+            }
         }
         let entries: Vec<ScopeEntry> =
             t.scope.iter().filter_map(|s| ScopeEntry::parse(s, self.cfg.allow_loopback_targets).ok()).collect();
@@ -723,7 +741,8 @@ impl Server {
         Ok(json!({"target": id, "project_ready": true, "scope": e["include"], "profiles": names}))
     }
 
-    /// Marks a target busy for an upload or removal; 409 while it has a queued or running run.
+    /// Marks a target busy for an upload or removal (until the caller's [`Busy`] drops); 409 while
+    /// it has a queued or running run.
     fn claim(&self, id: &str) -> Result<(), ApiError> {
         let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
         if self.db().live_runs_of(id).map_err(ApiError::db)? > 0 {
@@ -739,8 +758,9 @@ impl Server {
         if self.db().target(id).map_err(ApiError::db)?.is_none() {
             return Err(ApiError::not_found("target"));
         }
+        let _busy = Busy { server: self, id };
         self.claim(id)?;
-        let result = (|| {
+        (|| {
             let removed = self.cfg.work.join("removed");
             std::fs::create_dir_all(&removed).map_err(ApiError::io)?;
             let to = removed.join(format!("{id}-{}", time::now().replace([':', '.'], "")));
@@ -750,9 +770,7 @@ impl Server {
             self.db().delete_target(id).map_err(ApiError::db)?;
             self.write_system_scope().map_err(ApiError::io)?;
             Ok(json!({"id": id, "removed": true, "moved_to": to}))
-        })();
-        self.busy.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
-        result
+        })()
     }
 }
 
@@ -764,6 +782,19 @@ fn clip(s: &mut String) {
         }
         s.truncate(end);
         s.push('…');
+    }
+}
+
+/// Clears a target's busy mark (set by `claim`) when dropped, and wakes the scheduler.
+struct Busy<'a> {
+    server: &'a Server,
+    id: &'a str,
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.server.busy.lock().unwrap_or_else(|e| e.into_inner()).remove(self.id);
+        self.server.wake.notify_one();
     }
 }
 

@@ -50,8 +50,7 @@ jobs:
             --git https://github.com/r4nd0mth1ngs/brainproxy_server --rev "$SERVER_REF" brainproxy-server
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
-      # A run of the same commit within 24 hours is answered with that run, so a re-run of this
-      # job doesn't scan again (add --force to scan anyway).
+      # Each invocation scans the deploy that is live now; a re-run of this job scans again.
       - name: Scan
         env:
           BRAINPROXY_TOKEN: ${{ secrets.BRAINPROXY_TOKEN }}

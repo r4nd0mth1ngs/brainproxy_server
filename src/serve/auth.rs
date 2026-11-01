@@ -142,7 +142,8 @@ impl Limits {
                 *n + now.duration_since(*t).as_secs_f64() * cap / per.as_secs_f64() < cap
             });
             if map.len() > 10_000 {
-                map.clear();
+                // Only the per-address buckets: per-token limits must survive a flood.
+                map.retain(|(b, _), _| *b != Bucket::AuthFailure);
             }
         }
         let (tokens, last) = map.entry((bucket, key.to_string())).or_insert((capacity, now));

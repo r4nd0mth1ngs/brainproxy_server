@@ -496,9 +496,6 @@ struct TriggerBody {
     pipeline_url: Option<String>,
     /// Only to lower the depth below the target's preset.
     preset: Option<String>,
-    /// Scan again although this commit completed within 24 hours.
-    #[serde(default)]
-    force: bool,
 }
 
 fn parse_body<T: serde::de::DeserializeOwned + Default>(body: &Bytes) -> Result<T, ApiError> {
@@ -591,16 +588,6 @@ async fn trigger(
             return dedup(row, "idempotency_key");
         }
     }
-    let by_commit = match &b.commit {
-        Some(c) => s.db().run_for_commit(&t, &owner, c, &preset, now - DEDUP_MS).map_err(ApiError::db)?,
-        None => None,
-    };
-    if let Some(row) = by_commit
-        && (state::is_live(&row.state) || !b.force)
-    {
-        return dedup(row, "commit");
-    }
-
     let row = RunRow {
         id: new_run_id(),
         seq: 0,
@@ -624,21 +611,12 @@ async fn trigger(
         run_json: None,
         note: None,
     };
-    let enqueued = s.db().enqueue(&row, key.as_deref().map(|k| (owner.as_str(), k)));
+    // A commit is only a label the caller chose, so a completed run is never reused for it: only a
+    // still-queued run of the same caller, commit and preset answers (see `Db::enqueue`).
+    let enqueued = s.db().enqueue(&row, key.as_deref().map(|k| (owner.as_str(), k))).map_err(ApiError::db)?;
     let superseded = match enqueued {
-        Ok(sup) => sup,
-        Err(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
-            // A racing trigger of the same commit won: answer with its run.
-            let won = match &b.commit {
-                Some(c) => s.db().run_for_commit(&t, &owner, c, &preset, now - DEDUP_MS).map_err(ApiError::db)?,
-                None => None,
-            };
-            if let Some(won) = won {
-                return dedup(won, "commit");
-            }
-            return Err(ApiError::conflict("another trigger for this target won the race; try again"));
-        }
-        Err(e) => return Err(ApiError::db(e)),
+        db::Enqueued::New { superseded } => superseded,
+        db::Enqueued::Existing(existing) => return dedup(*existing, "commit"),
     };
     let mut e = caller.audit(ip, "trigger");
     e.target = Some(t.clone());

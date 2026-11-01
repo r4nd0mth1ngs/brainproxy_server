@@ -12,6 +12,17 @@ use super::target::TargetConfig;
 /// The most targets one server scans. Deliberately not a setting: the service is not a DAST platform.
 pub const MAX_TARGETS: usize = 10;
 
+/// `PRAGMA user_version` of `control.db`.
+const SCHEMA_VERSION: i64 = 1;
+
+/// What queueing a trigger did.
+pub enum Enqueued {
+    /// A new queued run, and the queued run it superseded.
+    New { superseded: Option<String> },
+    /// The same caller's queued run of the same commit and preset answers instead.
+    Existing(Box<RunRow>),
+}
+
 /// What a token may do on its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Perm {
@@ -160,8 +171,23 @@ pub struct Db {
 pub type Result<T> = rusqlite::Result<T>;
 
 impl Db {
-    pub fn open(path: &Path) -> Result<Db> {
+    pub fn open(path: &Path) -> std::result::Result<Db, String> {
+        Db::open_inner(path).map_err(|e| e.to_string())?.ok_or_else(|| {
+            format!(
+                "{} was made by an older development build of the server (schema {SCHEMA_VERSION} is needed); \
+                 move it away and register the targets again",
+                path.display()
+            )
+        })
+    }
+
+    fn open_inner(path: &Path) -> Result<Option<Db>> {
         let conn = Connection::open(path)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let fresh: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name = 'runs'", [], |r| r.get(0))?;
+        if fresh > 0 && version != SCHEMA_VERSION {
+            return Ok(None);
+        }
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -214,12 +240,9 @@ impl Db {
                 run_json TEXT,
                 note TEXT
             );
-            -- One running and one queued run per target, and one live run per caller, commit and
-            -- preset: of two racing triggers exactly one inserts.
+            -- One running and one queued run per target.
             CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running ON runs(target) WHERE state = 'running';
             CREATE UNIQUE INDEX IF NOT EXISTS runs_one_queued ON runs(target) WHERE state = 'queued';
-            CREATE UNIQUE INDEX IF NOT EXISTS runs_live_commit ON runs(target, owner, commit_sha, preset)
-                WHERE state IN ('queued', 'running') AND commit_sha IS NOT NULL AND baseline = 0;
             CREATE INDEX IF NOT EXISTS runs_target ON runs(target, seq);
 
             CREATE TABLE IF NOT EXISTS idempotency (
@@ -243,7 +266,8 @@ impl Db {
                 detail TEXT
             );"
         ))?;
-        Ok(Db { conn })
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        Ok(Some(Db { conn }))
     }
 
     // -- targets ---------------------------------------------------------------------------------
@@ -391,31 +415,6 @@ impl Db {
         rows.collect()
     }
 
-    /// The run that answers a repeated trigger: one of the same caller, commit and preset, live or
-    /// completed after `since`. Never a baseline run (it had no gate), never another caller's (the
-    /// commit is only a label the caller chose: another pipeline's run proves nothing about this one).
-    pub fn run_for_commit(
-        &self,
-        target: &str,
-        owner: &str,
-        commit: &str,
-        preset: &str,
-        since: i64,
-    ) -> Result<Option<RunRow>> {
-        self.conn
-            .query_row(
-                &format!(
-                    "SELECT {RUN_COLUMNS} FROM runs WHERE target = ?1 AND owner = ?2 AND commit_sha = ?3
-                     AND preset = ?4 AND baseline = 0
-                     AND (state IN ('queued', 'running') OR (state = 'completed' AND finished >= ?5))
-                     ORDER BY seq DESC LIMIT 1"
-                ),
-                params![target, owner, commit, preset, since],
-                run_row,
-            )
-            .optional()
-    }
-
     /// The run an `Idempotency-Key` of this token created after `since`.
     pub fn idempotent_run(&self, token: &str, key: &str, since: i64) -> Result<Option<String>> {
         self.conn
@@ -427,20 +426,48 @@ impl Db {
             .optional()
     }
 
-    /// Queues a run: a queued run of the same target becomes superseded. One transaction, so racing
-    /// triggers can't leave two queued runs. Returns the superseded run's id. Fails with a constraint
-    /// error when a racing trigger of the same commit won.
-    pub fn enqueue(&mut self, run: &RunRow, idempotency: Option<(&str, &str)>) -> Result<Option<String>> {
+    /// Queues a run, in one transaction. The target's queued run answers instead when it is the same
+    /// caller's trigger of the same commit and preset (it hasn't scanned anything yet, so it tests
+    /// what is deployed now); otherwise it becomes superseded and passes its one-shot settings on.
+    pub fn enqueue(&mut self, run: &RunRow, idempotency: Option<(&str, &str)>) -> Result<Enqueued> {
         let tx = self.conn.transaction()?;
-        let superseded: Option<String> = tx
-            .query_row("SELECT id FROM runs WHERE target = ?1 AND state = 'queued'", [&run.target], |r| r.get(0))
+        let queued = tx
+            .query_row(
+                &format!("SELECT {RUN_COLUMNS} FROM runs WHERE target = ?1 AND state = 'queued'"),
+                [&run.target],
+                run_row,
+            )
             .optional()?;
-        if let Some(old) = &superseded {
+        let remember = |tx: &rusqlite::Transaction, id: &str| -> Result<()> {
+            if let Some((token, key)) = idempotency {
+                tx.execute(
+                    "INSERT OR REPLACE INTO idempotency (token, key, run, created) VALUES (?1, ?2, ?3, ?4)",
+                    params![token, key, id, run.created],
+                )?;
+            }
+            Ok(())
+        };
+        if let Some(q) = &queued
+            && run.commit.is_some()
+            && q.commit == run.commit
+            && q.owner == run.owner
+            && q.preset == run.preset
+            && !q.baseline
+            && !run.baseline
+        {
+            remember(&tx, &q.id)?;
+            tx.commit()?;
+            return Ok(Enqueued::Existing(Box::new(q.clone())));
+        }
+        let (mut baseline, mut accept) = (run.baseline, run.accept_coverage_drop);
+        if let Some(q) = &queued {
             tx.execute(
                 "UPDATE runs SET state = 'superseded', outcome = 'incomplete', exit_code = 2, finished = ?2,
                  note = ?3 WHERE id = ?1",
-                params![old, run.created, format!("superseded by run {} before it started", run.id)],
+                params![q.id, run.created, format!("superseded by run {} before it started", run.id)],
             )?;
+            baseline |= q.baseline;
+            accept |= q.accept_coverage_drop;
         }
         tx.execute(
             "INSERT INTO runs (id, target, commit_sha, git_ref, pipeline_url, preset, state, created, actor,
@@ -454,26 +481,21 @@ impl Db {
                 run.preset,
                 run.created,
                 run.actor,
-                run.baseline,
-                run.accept_coverage_drop,
+                baseline,
+                accept,
                 run.owner
             ],
         )?;
-        if let Some((token, key)) = idempotency {
-            tx.execute(
-                "INSERT OR REPLACE INTO idempotency (token, key, run, created) VALUES (?1, ?2, ?3, ?4)",
-                params![token, key, run.id, run.created],
-            )?;
-        }
+        remember(&tx, &run.id)?;
         // The one-shot settings are used up by the run that took them.
-        if run.baseline || run.accept_coverage_drop {
+        if baseline || accept {
             tx.execute(
                 "UPDATE targets SET next_baseline = 0, next_accept_coverage_drop = 0 WHERE id = ?1",
                 [&run.target],
             )?;
         }
         tx.commit()?;
-        Ok(superseded)
+        Ok(Enqueued::New { superseded: queued.map(|q| q.id) })
     }
 
     /// queued → running. False when the run isn't queued any more (cancelled or superseded meanwhile).

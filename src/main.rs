@@ -132,7 +132,8 @@ struct RemoteCommon {
 struct RemoteRunOpts {
     #[command(flatten)]
     common: RemoteCommon,
-    /// Commit being tested: a run of the same commit within 24 hours is answered with that run.
+    /// Commit being tested, stored with the run. A queued run of the same commit (same token and
+    /// preset) answers instead of a second one.
     #[arg(long)]
     commit: Option<String>,
     /// Git ref, stored with the run.
@@ -144,10 +145,7 @@ struct RemoteRunOpts {
     /// A lighter scan than the target's own preset (never a deeper one).
     #[arg(long, value_enum)]
     preset: Option<Preset>,
-    /// Scan again even if this commit completed within 24 hours.
-    #[arg(long)]
-    force: bool,
-    /// Idempotency-Key for the trigger (default: the commit, or a random key per invocation).
+    /// Idempotency-Key for the trigger (default: a random key per invocation).
     #[arg(long)]
     idempotency_key: Option<String>,
     /// Print the queued run and exit 0 without waiting.
@@ -234,7 +232,6 @@ fn remote_args(c: RemoteCommon) -> remote::Args {
         git_ref: None,
         pipeline_url: None,
         preset: None,
-        force: false,
         idempotency_key: None,
         timeout: c.timeout,
         detach: false,
@@ -253,7 +250,6 @@ fn main() -> ExitCode {
             git_ref: o.git_ref,
             pipeline_url: o.pipeline_url,
             preset: o.preset.map(name),
-            force: o.force,
             idempotency_key: o.idempotency_key,
             detach: o.detach,
             ..remote_args(o.common)
