@@ -1,0 +1,6 @@
+# Public API only. The admin API (port 9091) is never proxied.
+{$SCAN_HOSTNAME} {
+	encode gzip
+	# Status requests long-poll for up to 60 seconds; Caddy's defaults allow that.
+	reverse_proxy brainproxy-server:9090
+}

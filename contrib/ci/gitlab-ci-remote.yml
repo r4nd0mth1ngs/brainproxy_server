@@ -1,0 +1,49 @@
+# Example: after the dev deploy, ask a brainproxy-server to scan the dev instance and wait for the
+# result. Add this job to .gitlab-ci.yml (with a `dast` stage after the deploy stage).
+#
+# Store the target token (POST /v1/targets/<id>/tokens on the server's admin API) as a masked,
+# protected CI/CD variable named BRAINPROXY_TOKEN (Settings > CI/CD > Variables). GitLab puts it in
+# the job's environment; remote run reads it from there.
+#
+# Exit codes of `remote run`:
+#   0 passed
+#   5 the gate failed (new findings at or above the target's fail_on risk)
+#   2 incomplete, superseded by a newer run, cancelled, or --timeout reached (never a pass)
+#   3 server unreachable, or it kept failing for 2 minutes
+#   4 unknown target
+#   6 out of scope
+#   1 anything else (a bad token, a refused trigger...)
+
+dast:
+  stage: dast
+  # brainproxy-server publishes no release binaries yet, so the job builds it from source in a Rust
+  # image (about two minutes). Once it does, use a small image and download the binary instead,
+  # for example (placeholder URL):
+  #   curl -fsSL -o /usr/local/bin/brainproxy-server \
+  #     "https://github.com/r4nd0mth1ngs/brainproxy_server/releases/download/v${SERVER_VERSION}/brainproxy-server-${SERVER_VERSION}-linux-x86_64"
+  #   echo "${SERVER_SHA256}  /usr/local/bin/brainproxy-server" | sha256sum -c -
+  #   chmod +x /usr/local/bin/brainproxy-server
+  image: rust:1-slim
+  timeout: 100m               # a little more than remote run's --timeout (default 90m)
+  variables:
+    SCAN_SERVER: https://scan.corp.test
+    SCAN_TARGET: shop-dev
+    SERVER_REF: main          # pin to a commit of brainproxy_server for repeatable builds
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  script:
+    - cargo install --locked --root "$CI_PROJECT_DIR/.bps"
+        --git https://github.com/r4nd0mth1ngs/brainproxy_server --rev "$SERVER_REF" brainproxy-server
+    # A run of the same commit within 24 hours is answered with that run (add --force to scan anyway).
+    - .bps/bin/brainproxy-server remote run --server "$SCAN_SERVER" --target "$SCAN_TARGET"
+        --commit "$CI_COMMIT_SHA" --ref "$CI_COMMIT_REF_NAME" --pipeline-url "$CI_PIPELINE_URL"
+        --sarif brainproxy.sarif --report brainproxy.html
+  # To let the pipeline go on when a scan is incomplete, but not when the gate fails:
+  # allow_failure:
+  #   exit_codes: [2]
+  artifacts:
+    when: always
+    paths:
+      - brainproxy.sarif
+      - brainproxy.html
+    expire_in: 30 days

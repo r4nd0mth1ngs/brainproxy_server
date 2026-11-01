@@ -1,0 +1,62 @@
+# Example: after the dev deploy, ask a brainproxy-server to scan the dev instance and wait for the
+# result. Add these steps to a job that runs after the deploy, or use the file as its own pipeline.
+#
+# Store the target token (POST /v1/targets/<id>/tokens on the server's admin API) as a secret
+# pipeline variable (or in a variable group) named BRAINPROXY_TOKEN. Secret variables don't reach
+# scripts on their own: the Scan step maps it with `env`.
+#
+# Exit codes of `remote run`:
+#   0 passed
+#   5 the gate failed (new findings at or above the target's fail_on risk)
+#   2 incomplete, superseded by a newer run, cancelled, or --timeout reached (never a pass)
+#   3 server unreachable, or it kept failing for 2 minutes
+#   4 unknown target
+#   6 out of scope
+#   1 anything else (a bad token, a refused trigger...)
+
+trigger: none   # start it from the deploy pipeline (resources.pipelines) or by hand
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  scanServer: https://scan.corp.test
+  scanTarget: shop-dev
+  serverRef: main             # pin to a commit of brainproxy_server for repeatable builds
+
+jobs:
+  - job: dast
+    timeoutInMinutes: 100     # a little more than remote run's --timeout (default 90m)
+    steps:
+      # brainproxy-server publishes no release binaries yet, so this builds it from source with the
+      # image's Rust (about two minutes). Once it does, download the binary instead, for example
+      # (placeholder URL):
+      #   curl -fsSL -o "$(Agent.TempDirectory)/brainproxy-server" \
+      #     "https://github.com/r4nd0mth1ngs/brainproxy_server/releases/download/v${SERVER_VERSION}/brainproxy-server-${SERVER_VERSION}-linux-x86_64"
+      #   echo "${SERVER_SHA256}  $(Agent.TempDirectory)/brainproxy-server" | sha256sum -c -
+      #   chmod +x "$(Agent.TempDirectory)/brainproxy-server"
+      - script: |
+          cargo install --locked --root "$(Agent.TempDirectory)/bps" \
+            --git https://github.com/r4nd0mth1ngs/brainproxy_server --rev "$(serverRef)" brainproxy-server
+          echo "##vso[task.prependpath]$(Agent.TempDirectory)/bps/bin"
+        displayName: brainproxy-server
+
+      # A run of the same commit within 24 hours is answered with that run (add --force to scan anyway).
+      - script: |
+          brainproxy-server remote run --server "$(scanServer)" --target "$(scanTarget)" \
+            --commit "$(Build.SourceVersion)" --ref "$(Build.SourceBranch)" \
+            --pipeline-url "$(System.CollectionUri)$(System.TeamProjectId)/_build/results?buildId=$(Build.BuildId)" \
+            --sarif "$(Build.ArtifactStagingDirectory)/brainproxy.sarif" \
+            --report "$(Build.ArtifactStagingDirectory)/brainproxy.html"
+        displayName: Scan
+        env:
+          BRAINPROXY_TOKEN: $(BRAINPROXY_TOKEN)
+
+      # The artifact name CodeAnalysisLogs is what the SARIF SAST Scans Tab extension reads, if
+      # it is installed.
+      - task: PublishBuildArtifacts@1
+        displayName: Publish the reports
+        condition: always()
+        inputs:
+          PathtoPublish: $(Build.ArtifactStagingDirectory)
+          ArtifactName: CodeAnalysisLogs

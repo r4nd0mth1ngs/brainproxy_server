@@ -1,0 +1,78 @@
+# Example: after each deploy of the dev instance, ask a brainproxy-server to scan it, wait for the
+# result, and upload the findings to code scanning. The server keeps the project and the history,
+# so the runner needs no cache and no access to the dev instance, only to the server.
+#
+# Copy to .github/workflows/dast.yml in the app's repository and change the env values. Store the
+# target token (POST /v1/targets/<id>/tokens on the server's admin API) as the repository secret
+# BRAINPROXY_TOKEN.
+#
+# Exit codes of `remote run`:
+#   0 passed
+#   5 the gate failed (new findings at or above the target's fail_on risk)
+#   2 incomplete, superseded by a newer run, cancelled, or --timeout reached (never a pass)
+#   3 server unreachable, or it kept failing for 2 minutes
+#   4 unknown target
+#   6 out of scope
+#   1 anything else (a bad token, a refused trigger...)
+
+name: dast
+
+on:
+  workflow_run:
+    workflows: [deploy-dev]   # the workflow that deploys the dev instance
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write      # for the SARIF upload
+
+env:
+  SCAN_SERVER: https://scan.corp.test
+  SCAN_TARGET: shop-dev
+  SERVER_REF: main            # pin to a commit of brainproxy_server for repeatable builds
+
+jobs:
+  scan:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 100      # a little more than remote run's --timeout (default 90m)
+    steps:
+      # brainproxy-server publishes no release binaries yet, so this builds it from source (about
+      # two minutes). Once it does, download the binary instead, for example (placeholder URL):
+      #   curl -fsSL -o "$RUNNER_TEMP/bin/brainproxy-server" \
+      #     "https://github.com/r4nd0mth1ngs/brainproxy_server/releases/download/v${SERVER_VERSION}/brainproxy-server-${SERVER_VERSION}-linux-x86_64"
+      #   echo "${SERVER_SHA256}  $RUNNER_TEMP/bin/brainproxy-server" | sha256sum -c -
+      #   chmod +x "$RUNNER_TEMP/bin/brainproxy-server"
+      - name: brainproxy-server
+        run: |
+          cargo install --locked --root "$RUNNER_TEMP" \
+            --git https://github.com/r4nd0mth1ngs/brainproxy_server --rev "$SERVER_REF" brainproxy-server
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # A run of the same commit within 24 hours is answered with that run, so a re-run of this
+      # job doesn't scan again (add --force to scan anyway).
+      - name: Scan
+        env:
+          BRAINPROXY_TOKEN: ${{ secrets.BRAINPROXY_TOKEN }}
+          COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          REF: ${{ github.event.workflow_run.head_branch || github.ref }}
+          PIPELINE_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          brainproxy-server remote run --server "$SCAN_SERVER" --target "$SCAN_TARGET" \
+            --commit "$COMMIT" --ref "$REF" --pipeline-url "$PIPELINE_URL" \
+            --sarif brainproxy.sarif --report brainproxy.html
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles('brainproxy.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: brainproxy.sarif
+          category: dast
+
+      - name: Upload the HTML report
+        if: always() && hashFiles('brainproxy.html') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-report
+          path: brainproxy.html

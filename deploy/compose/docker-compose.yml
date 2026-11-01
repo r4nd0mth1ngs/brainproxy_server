@@ -1,0 +1,75 @@
+# The reference deployment: brainproxy-server behind Caddy (automatic TLS). See README.md here.
+#
+#   SCAN_HOSTNAME=scan.corp.test docker compose up -d
+#
+# Single replica only: control.db (SQLite) and the project files live on one local volume.
+
+name: brainproxy
+
+services:
+  brainproxy-server:
+    build:
+      context: ../..
+      dockerfile: docker/server.Dockerfile
+    image: brainproxy-server:local
+    restart: unless-stopped
+    # --trust-forwarded: Caddy sets X-Forwarded-For, so rate limits and the audit log see the
+    # pipeline's address instead of Caddy's.
+    # Add --allow-loopback-targets only to try the server out against an app on this machine.
+    command:
+      - serve
+      - --listen=0.0.0.0:9090
+      - --admin-listen=0.0.0.0:9091
+      - --admin-token-file=/run/secrets/admin_token
+      - --trust-forwarded
+    volumes:
+      - work:/work
+    secrets:
+      - admin_token
+      # Target secrets: the file /run/secrets/<target>/<VARIABLE> holds the value of a variable
+      # the target's secret_env names (see README.md). One example:
+      # - source: shop_dev_app_password
+      #   target: /run/secrets/shop-dev/APP_PASSWORD
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # Admin API: this host only (curl http://127.0.0.1:9091/...). Never publish it more widely and
+    # never route it through Caddy. The public API (9090) is reached only through Caddy.
+    ports:
+      - "127.0.0.1:9091:9091"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/v1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  caddy:
+    image: caddy:2.10
+    restart: unless-stopped
+    environment:
+      SCAN_HOSTNAME: ${SCAN_HOSTNAME:?set SCAN_HOSTNAME to the server's DNS name}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - brainproxy-server
+
+volumes:
+  # Must stay a local volume: no NFS, EFS or Azure Files (SQLite and file locks need local disk).
+  work:
+  caddy_data:
+  caddy_config:
+
+secrets:
+  admin_token:
+    file: ./secrets/admin_token
+  # shop_dev_app_password:
+  #   file: ./secrets/shop-dev/APP_PASSWORD

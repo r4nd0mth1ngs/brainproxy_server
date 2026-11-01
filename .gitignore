@@ -2,3 +2,4 @@ target/
 research/
 *.bpdb
 *.bpdb-*
+deploy/compose/secrets/
