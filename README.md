@@ -19,6 +19,10 @@ cargo install --locked --git https://github.com/r4nd0mth1ngs/brainproxy_server b
 # Once: a project with a scope (and, for a logged-in scan, an auth profile). ci never creates one.
 brainproxy --project app.bpdb engagement start --target shop-dev.example.test
 
+# Once, on an app with known issues: accept what is there now as the starting point.
+brainproxy-server ci --project app.bpdb --url https://shop-dev.example.test/ --preset standard \
+    --baseline --out runs
+
 # After each deploy:
 brainproxy-server ci --project app.bpdb --url https://shop-dev.example.test/ --preset standard \
     --fail-on high --new-only --out runs [--max-minutes 60] [--auth user]
@@ -36,9 +40,13 @@ It:
    preset covered (attacked requests or crawled endpoints) is **incomplete**, never a pass. After a
    real shrink of the app, run once with `--accept-coverage-drop`;
 5. compares with `findings compare --scan J --since-scan P`, where P is the previous run that
-   **passed**: "new" means first seen after P finished, so a finding first seen by a failed or
-   gate-failed run stays new until a run passes. The gate (`--fail-on`, `--new-only`) only runs on a
-   complete scan;
+   **passed** with the same URL, preset and auth profile and a gate at least as strict (a risk at or
+   below this one; `--new-only` only if this run has it too), or a `--baseline` run. "New" means
+   first seen after P finished, so a finding first seen by a failed, gate-failed, narrower or laxer
+   run stays new until a run like this one passes. Without such a run every finding this scan made
+   is new: start with `--baseline` (no gate) to accept what an app already has. The gate
+   (`--fail-on`, `--new-only`) only runs on a complete scan, and an exit 0 from `findings compare`
+   only counts with a complete result whose gate passed;
 6. writes `run.json`, `compare.json` (the CLI's output as it is), `report.json`, `report.html` and
    `report.sarif` (only what this scan found) to `runs/<start time>-<job>/`;
 7. exits with the CLI's codes:
@@ -53,10 +61,13 @@ It:
 | `3` | Network error |
 | `1` | Anything else |
 
-SIGINT or SIGTERM (a cancelled CI job) stops the scan job and ends the run as incomplete. The run
+SIGINT or SIGTERM (a cancelled CI job) stops the scan job, writes `run.json` as incomplete at once
+(runners kill the process a few seconds later), and ends the run as incomplete, even if the job
+completed meanwhile. If `job wait` keeps failing, the job is stopped too: a scan is never left
+running. Failed rule units (`result.errors`) are listed in the reasons. The run
 folder is the history the next run reads: keep it together with the project file, for example in
 the CI cache. `run.json` has the job, the since-scan job, coverage and its baseline, the drift
-summary, the gate, the outcome and every reason. Progress and a summary go to stderr; `run.json` is
+summary, the gate, the outcome, every reason and the run folder (`folder`). Progress and a summary go to stderr; `run.json` is
 also printed on stdout.
 
 [`contrib/ci/github-actions.yml`](contrib/ci/github-actions.yml) is a complete GitHub Actions

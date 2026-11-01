@@ -14,6 +14,11 @@ on:
     workflows: [deploy-dev]   # the workflow that deploys the dev instance
     types: [completed]
   workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Baseline run: no gate; accept the findings the app has now"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -54,7 +59,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: dast
-          key: dast-${{ github.run_id }}
+          key: dast-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: dast-
 
       # Explicit first-time setup: ci itself never creates a project. If the cache was evicted
@@ -75,11 +80,16 @@ jobs:
           APP_PASSWORD: ${{ secrets.DAST_APP_PASSWORD }}   # only if an auth profile uses it
         run: |
           set +e
+          # Without a baseline or an earlier passed run, every finding is new: start with a manual
+          # "baseline" run (workflow_dispatch) on an app with known issues.
+          if [ "${{ inputs.baseline }}" = "true" ]; then gate="--baseline"; else gate="--fail-on $FAIL_ON --new-only"; fi
           brainproxy-server ci --project dast/app.bpdb --url "$TARGET_URL" --preset "$PRESET" \
-            --fail-on "$FAIL_ON" --new-only --out dast/runs --max-minutes 60   # add: --auth user
+            $gate --out dast/runs --max-minutes 60 > "$RUNNER_TEMP/run.json"   # add: --auth user
           code=$?
           echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "run=$(ls -d dast/runs/*/ | tail -n 1)" >> "$GITHUB_OUTPUT"
+          # This run's folder; empty when ci refused before starting one (no folder of an older run).
+          folder=$(jq -r '.folder // empty' "$RUNNER_TEMP/run.json" 2>/dev/null)
+          echo "run=${folder:+$folder/}" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Save the project and run history
@@ -87,7 +97,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: dast
-          key: dast-${{ github.run_id }}
+          key: dast-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload the run folder
         if: always() && steps.ci.outputs.run != ''

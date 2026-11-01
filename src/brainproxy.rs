@@ -79,6 +79,10 @@ impl Cli {
 /// Runs a command that prints a brainproxy JSON envelope.
 pub async fn run(mut cmd: Command) -> std::io::Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    // Its own process group, so a Ctrl-C or a CI runner signalling ours reaches `ci` (which then
+    // stops the scan job) rather than killing the `job wait` it is running.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let out = cmd.output().await?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();

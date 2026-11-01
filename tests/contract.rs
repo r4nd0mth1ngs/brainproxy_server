@@ -332,8 +332,8 @@ fn drift_gate_and_new_until_a_run_passes() {
     let url = app.url();
     let gate = ["--fail-on", "high", "--new-only"];
 
-    // 1: first run, no gate: passed; the XSS is new.
-    let (code, r1) = env.ci(&url, &[]);
+    // 1: the baseline run, no gate: passed; the XSS is new.
+    let (code, r1) = env.ci(&url, &["--baseline"]);
     assert_eq!(code, 0, "{r1}");
     assert_eq!(r1["outcome"], "passed");
     assert!(r1["since_scan"].is_null());
@@ -546,4 +546,49 @@ fn a_live_scan_in_the_project_is_refused_and_a_dead_one_is_not() {
     app.state.delay_ms.store(0, Ordering::SeqCst);
     let (code, run) = env.ci(&app.url(), &[]);
     assert_eq!(code, 0, "refused because of a dead scan: {run}");
+}
+
+/// A CLI wrapper whose `findings compare` exits 0 without an envelope must not make a pass.
+#[test]
+fn a_compare_that_exits_0_without_a_result_is_not_a_pass() {
+    let Some(env) = Env::new() else { return };
+    let app = App::start(1);
+    env.engage(&app);
+    let wrapper = env.dir.path().join("brainproxy-wrapper");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = compare ] && {{ echo 'not json'; exit 0; }}; done\nexec '{}' \"$@\"\n",
+            env.bin.display()
+        ),
+    )
+    .unwrap();
+    Command::new("chmod").arg("+x").arg(&wrapper).status().unwrap();
+    let mut cmd = env.ci_command(&app.url(), &["--fail-on", "high"]);
+    let (code, run) = result(cmd.env("BRAINPROXY_BIN", &wrapper).output().unwrap());
+    assert_eq!(code, 1, "{run}");
+    assert_eq!(run["outcome"], "error");
+}
+
+/// Ctrl-C reaches the whole process group; the scan must still be stopped, not left running.
+#[test]
+fn ctrl_c_to_the_process_group_stops_the_scan() {
+    let Some(env) = Env::new() else { return };
+    let app = App::start(20);
+    app.state.delay_ms.store(150, Ordering::SeqCst);
+    env.engage(&app);
+    let mut cmd = env.ci_command(&app.url(), &[]);
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    wait_for_running_job(&env);
+    let group = format!("-{}", child.id());
+    let ok = Command::new("kill").args(["-INT", "--", &group]).status().unwrap().success();
+    assert!(ok);
+    let (code, run) = result(child.wait_with_output().unwrap());
+    assert_eq!(code, 2, "{run}");
+    assert!(run["reasons"].to_string().contains("SIGINT"), "{run}");
+    let jobs = env.brainproxy(&["job", "list"]);
+    let state = jobs["data"]["jobs"][0]["state"].as_str().unwrap().to_string();
+    assert!(state == "stopped" || state == "stopping", "job left {state}");
+    assert!(!run["folder"].is_null());
 }

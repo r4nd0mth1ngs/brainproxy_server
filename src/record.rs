@@ -106,6 +106,12 @@ pub struct Run {
     pub exit_code: Option<i32>,
     /// Files written next to `run.json`.
     pub files: Vec<String>,
+    /// Started with `--baseline`: no gate, and later runs may count new findings from it.
+    #[serde(default)]
+    pub baseline: bool,
+    /// The run folder (set when the run ends).
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
 }
 
 impl Run {
@@ -143,10 +149,38 @@ pub fn history(dir: &Path) -> std::io::Result<Vec<Past>> {
     Ok(out)
 }
 
-/// Candidates for `--since-scan`, newest first: runs that passed. A run whose gate failed isn't
-/// one, so what it found stays new until a run passes; a run that didn't complete never is.
-pub fn since_scan_candidates(history: &[Past]) -> impl Iterator<Item = &Past> {
-    history.iter().rev().filter(|p| p.run.outcome == Outcome::Passed && p.run.job.is_some())
+/// Candidates for `--since-scan`, newest first: runs that passed, of the same URL, preset and auth
+/// profile, with a gate at least as strict as `now`'s. A run whose gate failed isn't one, so what it
+/// found stays new until a run passes; nor is a run that didn't complete, nor a narrower or laxer one
+/// that passed without finding again what an earlier run failed on. A `--baseline` run is one: it
+/// deliberately accepts what is there.
+pub fn since_scan_candidates<'a>(history: &'a [Past], now: &'a Run) -> impl Iterator<Item = &'a Past> {
+    history.iter().rev().filter(move |p| {
+        let r = &p.run;
+        r.outcome == Outcome::Passed
+            && r.job.is_some()
+            && r.url == now.url
+            && r.preset == now.preset
+            && r.auth == now.auth
+            && (r.baseline || gate_as_strict(r, now))
+    })
+}
+
+/// `past`'s gate was at least as strict as `now`'s: a risk at or below it, and `--new-only` only if
+/// `now` has it too. No gate now: anything goes.
+fn gate_as_strict(past: &Run, now: &Run) -> bool {
+    let Some(want) = now.fail_on.as_deref() else { return true };
+    let Some(had) = past.fail_on.as_deref() else { return false };
+    risk_rank(had) <= risk_rank(want) && (!past.new_only || now.new_only)
+}
+
+fn risk_rank(r: &str) -> u8 {
+    match r {
+        "info" => 0,
+        "low" => 1,
+        "medium" => 2,
+        _ => 3,
+    }
 }
 
 /// Candidates for the coverage baseline, newest first: runs of the same URL and preset whose scan
@@ -208,6 +242,8 @@ mod tests {
             reasons: vec![],
             exit_code: None,
             files: vec![],
+            baseline: false,
+            folder: None,
         }
     }
 
@@ -230,12 +266,41 @@ mod tests {
         std::fs::write(d.join("junk.txt"), "x").unwrap();
         let h = history(d).unwrap();
         assert_eq!(h.len(), 6);
-        let since: Vec<u64> = since_scan_candidates(&h).map(|p| p.run.job.as_ref().unwrap().id).collect();
-        assert_eq!(since, [2, 1]);
+        let ids = |now: &Run| -> Vec<u64> {
+            since_scan_candidates(&h, now).map(|p| p.run.job.as_ref().unwrap().id).collect()
+        };
+        assert_eq!(ids(&run(Outcome::Running, 9, "http://a/", "quick")), [1]);
+        assert_eq!(ids(&run(Outcome::Running, 9, "http://a/", "standard")), [2]);
+        assert!(ids(&run(Outcome::Running, 9, "http://b/", "quick")).is_empty());
         let cov: Vec<u64> =
             coverage_candidates(&h, "http://a/", "quick").map(|p| p.run.job.as_ref().unwrap().id).collect();
         assert_eq!(cov, [3, 1]);
         assert_eq!(coverage_candidates(&h, "http://b/", "quick").count(), 0);
+    }
+
+    #[test]
+    fn since_scan_needs_a_gate_as_strict() {
+        let gated = |risk: Option<&str>, new_only: bool| {
+            let mut r = run(Outcome::Passed, 1, "u", "p");
+            r.fail_on = risk.map(String::from);
+            r.new_only = new_only;
+            r
+        };
+        let ok = |past: &Run, now: &Run| gate_as_strict(past, now);
+        assert!(ok(&gated(Some("medium"), false), &gated(Some("high"), true)));
+        assert!(ok(&gated(Some("high"), true), &gated(Some("high"), true)));
+        assert!(!ok(&gated(Some("high"), true), &gated(Some("high"), false)));
+        assert!(!ok(&gated(Some("high"), false), &gated(Some("medium"), false)));
+        assert!(!ok(&gated(None, false), &gated(Some("high"), true)));
+        assert!(ok(&gated(None, false), &gated(None, false)));
+        let mut other_auth = gated(None, false);
+        other_auth.auth = Some("user".into());
+        let h = vec![Past { dir: "x".into(), run: other_auth }];
+        assert_eq!(since_scan_candidates(&h, &gated(None, false)).count(), 0);
+        let mut base = gated(None, false);
+        base.baseline = true;
+        let h = vec![Past { dir: "x".into(), run: base }];
+        assert_eq!(since_scan_candidates(&h, &gated(Some("info"), false)).count(), 1);
     }
 
     #[test]

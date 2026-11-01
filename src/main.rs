@@ -59,6 +59,10 @@ struct CiOpts {
     /// Don't treat coverage below half of the previous run as incomplete (once, after the app really shrank).
     #[arg(long)]
     accept_coverage_drop: bool,
+    /// Start the history here: no gate, and later gated runs count as new only what is first seen
+    /// after this run. For a first run on an app with known issues; recorded in run.json.
+    #[arg(long, conflicts_with = "fail_on")]
+    baseline: bool,
     /// The brainproxy CLI to run.
     #[arg(long, env = "BRAINPROXY_BIN", default_value = "brainproxy")]
     brainproxy: PathBuf,
@@ -104,6 +108,7 @@ fn main() -> ExitCode {
             max_minutes: o.max_minutes,
             auth: o.auth,
             accept_coverage_drop: o.accept_coverage_drop,
+            baseline: o.baseline,
         })),
     };
     ExitCode::from(u8::try_from(code).unwrap_or(1))

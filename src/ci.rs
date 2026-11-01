@@ -15,8 +15,11 @@ pub const LOCK_FILE: &str = ".brainproxy-server.lock";
 
 /// Seconds per `job wait` call; a progress line is printed after each.
 const WAIT_STEP_SECS: u64 = 60;
-/// How long to wait for a stopped scan to wind down after a cancel.
-const STOP_GRACE_SECS: u64 = 60;
+/// How long to wait for a stopped scan to wind down after a cancel. Short: CI runners send SIGKILL
+/// a few seconds after the first signal (GitHub: about 10 s).
+const STOP_GRACE_SECS: u64 = 5;
+/// `job wait` failures in a row before the job is given up on (and stopped).
+const WAIT_RETRIES: u32 = 3;
 /// `--limit` for compare.json and the reports, so that nothing is cut off.
 const NO_LIMIT: &str = "1000000";
 
@@ -32,6 +35,7 @@ pub struct Args {
     pub max_minutes: Option<u64>,
     pub auth: Option<String>,
     pub accept_coverage_drop: bool,
+    pub baseline: bool,
 }
 
 /// Runs `ci` and returns the exit code. Progress and the summary go to stderr, `run.json` to stdout.
@@ -53,6 +57,8 @@ struct Ci {
     _lock: File,
     run: Run,
     history: Vec<record::Past>,
+    /// The signal that cancelled the run, once one has.
+    cancelled: Option<&'static str>,
 }
 
 type Refusal = (i32, String);
@@ -91,7 +97,7 @@ impl Ci {
         let lock = lock(&args.out)?;
 
         // One scan per project at a time: a second one would overlap the first's time window.
-        let jobs = call(&cli, ["job", "list"]).await?;
+        let jobs = call(&cli, ["job", "list", "--limit", NO_LIMIT]).await?;
         if !jobs.ok() {
             return Err((jobs.code, format!("job list: {}", jobs.message())));
         }
@@ -138,8 +144,10 @@ impl Ci {
             reasons: vec![],
             exit_code: None,
             files: vec![],
+            baseline: args.baseline,
+            folder: None,
         };
-        Ok(Ci { args, cli, _lock: lock, run, history })
+        Ok(Ci { args, cli, _lock: lock, run, history, cancelled: None })
     }
 
     /// Runs the scan and everything after it. Every path from here writes `run.json`.
@@ -184,12 +192,15 @@ impl Ci {
         let status = call(&self.cli, ["job".into(), "status".into(), id.to_string()]).await.map_err(stop_error)?;
         self.run.job = Some(job_from(id, status.data()));
         let folder = self.folder(Some(id));
-        self.write(&folder);
+        let _ = self.write(&folder);
         eprintln!("brainproxy-server: job {id} started, run folder {}", folder.display());
 
-        let status = self.wait(id, cancel).await;
+        let status = self.wait(id, &folder, cancel).await;
         self.run.job = Some(job_from(id, status.data()));
         let result = &status.data()["result"];
+        if let Some(n) = result["errors"].as_u64().filter(|n| *n > 0) {
+            self.run.reasons.push(format!("{n} rule unit(s) of the scan failed; their checks may not have run"));
+        }
         if result.is_object() {
             self.run.coverage = Some(Coverage {
                 targets: result["targets"].as_u64().unwrap_or(0),
@@ -200,49 +211,84 @@ impl Ci {
         Ok(folder)
     }
 
-    /// `job wait` in steps until the job is finished, stopping it on a cancel. Returns the last status.
-    async fn wait(&mut self, id: u64, cancel: &mut watch::Receiver<Option<&'static str>>) -> Output {
+    /// `job wait` in steps until the job is finished, stopping it on a cancel or when waiting keeps
+    /// failing, so that a scan is never left running. Returns the last status.
+    async fn wait(&mut self, id: u64, folder: &Path, cancel: &mut watch::Receiver<Option<&'static str>>) -> Output {
         let wait_argv = ["job".into(), "wait".into(), id.to_string(), "--timeout".into(), WAIT_STEP_SECS.to_string()];
+        let mut failures = 0;
         loop {
             let out = tokio::select! {
                 out = call(&self.cli, &wait_argv) => out,
-                _ = cancel.changed() => {
-                    let sig = cancel.borrow().unwrap_or("a signal");
-                    eprintln!("brainproxy-server: {sig}: stopping job {id}");
-                    self.run.reasons.push(format!("cancelled by {sig}; job {id} was stopped"));
-                    let _ = call(&self.cli, ["job".into(), "stop".into(), id.to_string()]).await;
-                    let grace = ["job".into(), "wait".into(), id.to_string(), "--timeout".into(), STOP_GRACE_SECS.to_string()];
-                    return match call(&self.cli, &grace).await {
-                        Ok(out) => out,
-                        Err(e) => io_output(e),
-                    };
+                _ = cancel.changed() => return self.cancel(id, folder, cancel).await,
+            };
+            let failed = match out {
+                Ok(out) if out.ok() => {
+                    if is_finished(out.data()["state"].as_str().unwrap_or("")) {
+                        return out;
+                    }
+                    failures = 0;
+                    eprintln!(
+                        "brainproxy-server: job {id} {}: {}",
+                        out.data()["state"].as_str().unwrap_or("?"),
+                        compact(&out.data()["progress"])
+                    );
+                    continue;
                 }
+                Ok(out) => out.message(),
+                Err((_, e)) => e,
             };
-            let out = match out {
-                Ok(out) => out,
-                Err(e) => return io_output(e),
-            };
-            if !out.ok() || is_finished(out.data()["state"].as_str().unwrap_or("")) {
-                return out;
+            if cancel.borrow().is_some() {
+                return self.cancel(id, folder, cancel).await;
             }
-            eprintln!(
-                "brainproxy-server: job {id} {}: {}",
-                out.data()["state"].as_str().unwrap_or("?"),
-                compact(&out.data()["progress"])
-            );
+            failures += 1;
+            eprintln!("brainproxy-server: job wait {id} failed ({failures}/{WAIT_RETRIES}): {failed}");
+            if failures >= WAIT_RETRIES {
+                self.run.reasons.push(format!("job wait {id} kept failing ({failed}); the job was asked to stop"));
+                let _ = call(&self.cli, ["job".into(), "stop".into(), id.to_string()]).await;
+                return self.status(id).await;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                _ = cancel.changed() => return self.cancel(id, folder, cancel).await,
+            }
+        }
+    }
+
+    /// Stops the job after a signal and writes `run.json` as incomplete straight away, in case the
+    /// runner kills this process before the compare and the reports are done. A second signal cuts
+    /// the wait for the job short.
+    async fn cancel(&mut self, id: u64, folder: &Path, cancel: &mut watch::Receiver<Option<&'static str>>) -> Output {
+        let sig = cancel.borrow_and_update().unwrap_or("a signal");
+        self.cancelled = Some(sig);
+        eprintln!("brainproxy-server: {sig}: stopping job {id}");
+        self.run.reasons.push(format!("cancelled by {sig}; job {id} was asked to stop"));
+        let _ = call(&self.cli, ["job".into(), "stop".into(), id.to_string()]).await;
+        self.run.outcome = Outcome::Incomplete;
+        self.run.exit_code = Some(code::USAGE);
+        let _ = self.write(folder);
+        let grace = ["job".into(), "wait".into(), id.to_string(), "--timeout".into(), STOP_GRACE_SECS.to_string()];
+        tokio::select! {
+            _ = call(&self.cli, &grace) => {}
+            _ = cancel.changed() => {}
+        }
+        self.status(id).await
+    }
+
+    async fn status(&self, id: u64) -> Output {
+        match call(&self.cli, ["job".into(), "status".into(), id.to_string()]).await {
+            Ok(out) => out,
+            Err(e) => io_output(e),
         }
     }
 
     /// Applies the outcome rules, then compares, gates and writes the reports.
     async fn judge(&mut self, folder: &Path) -> (Outcome, i32) {
         let job = self.run.job.clone().unwrap_or_default();
-        let mut complete = true;
+        // A cancelled run never passes, even if its job completed before the stop reached it.
+        let mut complete = self.cancelled.is_none();
         if job.state != "completed" {
             complete = false;
-            let why = match self.run.reasons.iter().any(|r| r.starts_with("cancelled")) {
-                true => String::new(),
-                false => self.job_error(job.id).await,
-            };
+            let why = if self.cancelled.is_some() { String::new() } else { self.job_error(job.id).await };
             self.run.reasons.push(format!(
                 "job {} {}{why}",
                 job.id,
@@ -290,8 +336,9 @@ impl Ci {
         }
         match call(&self.cli, &argv).await {
             Ok(cmp) => {
-                if !cmp.stdout.trim().is_empty() {
-                    self.save(folder, "compare.json", cmp.stdout.as_bytes());
+                let saved = cmp.stdout.trim().is_empty() || self.save(folder, "compare.json", cmp.stdout.as_bytes());
+                if !saved && outcome == Outcome::Passed {
+                    (outcome, exit) = (Outcome::Error, code::ERROR);
                 }
                 let d = cmp.data();
                 if cmp.json["ok"] == true {
@@ -313,8 +360,11 @@ impl Ci {
                         self.run.reasons.push(format!("compare: {w}"));
                     }
                 }
+                // Exit 0 only counts with a complete envelope and, when gating, a gate that passed.
+                let gated = complete && self.args.fail_on.is_some();
+                let gate_passed = self.run.gate.as_ref().is_some_and(|g| g.passed);
                 match cmp.code {
-                    code::OK => {}
+                    code::OK if cmp.json["ok"] == true && (!gated || gate_passed) => {}
                     code::GATE_FAILED if complete && cmp.json["ok"] == true => {
                         outcome = Outcome::Failed;
                         exit = code::GATE_FAILED;
@@ -326,7 +376,12 @@ impl Ci {
                         ));
                     }
                     c => {
-                        self.run.reasons.push(format!("findings compare: {}", cmp.message()));
+                        let message = if c == code::OK {
+                            "exited 0 without a complete result or a passed gate".to_string()
+                        } else {
+                            cmp.message()
+                        };
+                        self.run.reasons.push(format!("findings compare: {message}"));
                         if outcome != Outcome::Incomplete {
                             outcome = Outcome::Error;
                             exit = nonzero(c);
@@ -374,7 +429,7 @@ impl Ci {
 
     /// The newest passed run whose job is still the same job in this project.
     async fn pick_since_scan(&mut self) -> Result<(), Stop> {
-        let candidates: Vec<record::Past> = record::since_scan_candidates(&self.history).cloned().collect();
+        let candidates: Vec<record::Past> = record::since_scan_candidates(&self.history, &self.run).cloned().collect();
         for past in candidates {
             let Some(job) = &past.run.job else { continue };
             let status =
@@ -443,7 +498,10 @@ impl Ci {
 
     /// `DIR/<time>-<job>/`, created. A second run without a job in the same second gets a suffix.
     fn folder(&self, job: Option<u64>) -> PathBuf {
-        let start = self.run.job.as_ref().map_or(self.run.started_at.as_str(), |j| j.time.as_str());
+        let start = match self.run.job.as_ref() {
+            Some(j) if !j.time.is_empty() => j.time.as_str(),
+            _ => self.run.started_at.as_str(),
+        };
         let base = record::folder_name(start, job);
         let mut path = self.args.out.join(&base);
         let mut n = 1;
@@ -461,7 +519,14 @@ impl Ci {
         self.run.outcome = outcome;
         self.run.exit_code = Some(exit);
         self.run.finished_at = Some(time::now());
-        self.write(folder);
+        self.run.folder = Some(folder.to_path_buf());
+        let mut exit = exit;
+        if !self.write(folder) && exit == code::OK {
+            // A pass that can't be recorded would drop out of the history; don't call it one.
+            self.run.outcome = Outcome::Error;
+            self.run.exit_code = Some(code::ERROR);
+            exit = code::ERROR;
+        }
         eprintln!("brainproxy-server: {}", summary_line(&self.run, folder));
         for r in &self.run.reasons {
             eprintln!("  - {r}");
@@ -471,18 +536,28 @@ impl Ci {
     }
 
     /// Writes `run.json` (through a temporary file, so a reader never sees half of it).
-    fn write(&mut self, folder: &Path) {
+    fn write(&mut self, folder: &Path) -> bool {
         let text = serde_json::to_vec_pretty(&self.run).unwrap_or_default();
         let tmp = folder.join(".run.json.tmp");
-        if let Err(e) = std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, folder.join(record::RUN_FILE))) {
-            eprintln!("brainproxy-server: can't write {}: {e}", folder.join(record::RUN_FILE).display());
+        match std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, folder.join(record::RUN_FILE))) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("brainproxy-server: can't write {}: {e}", folder.join(record::RUN_FILE).display());
+                false
+            }
         }
     }
 
-    fn save(&mut self, folder: &Path, name: &str, bytes: &[u8]) {
+    fn save(&mut self, folder: &Path, name: &str, bytes: &[u8]) -> bool {
         match std::fs::write(folder.join(name), bytes) {
-            Ok(()) => self.run.files.push(name.into()),
-            Err(e) => self.run.reasons.push(format!("can't write {name}: {e}")),
+            Ok(()) => {
+                self.run.files.push(name.into());
+                true
+            }
+            Err(e) => {
+                self.run.reasons.push(format!("can't write {name}: {e}"));
+                false
+            }
         }
     }
 }
@@ -573,13 +648,17 @@ fn lock(out: &Path) -> Result<File, Refusal> {
     }
 }
 
-/// Becomes `Some(signal name)` on SIGINT or SIGTERM (Ctrl-C elsewhere). A CI cancel sends one of
-/// these; the scan job is then stopped and the run ends as incomplete.
+/// Becomes `Some(signal name)` on SIGINT or SIGTERM (Ctrl-C elsewhere), and changes again on every
+/// further signal. A CI cancel sends these; the scan job is then stopped and the run ends as incomplete.
 fn cancel_signal() -> watch::Receiver<Option<&'static str>> {
     let (tx, rx) = watch::channel(None);
     tokio::spawn(async move {
-        let name = wait_signal().await;
-        let _ = tx.send(Some(name));
+        loop {
+            let name = wait_signal().await;
+            if tx.send(Some(name)).is_err() {
+                return;
+            }
+        }
     });
     rx
 }
