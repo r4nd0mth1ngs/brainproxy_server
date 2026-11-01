@@ -1,0 +1,113 @@
+# Example: scan a dev instance after each deploy, gate on new high-risk findings, and keep the
+# project file and run history in the Actions cache between runs.
+#
+# Copy to .github/workflows/dast.yml in the app's repository and change the env values.
+# The runner must be able to reach the dev instance (use a self-hosted runner for internal hosts).
+#
+# Exit codes are the brainproxy CLI's: 0 passed, 5 the gate found something, 2 incomplete (the scan
+# failed, was cut short, the login broke or coverage dropped: never a pass), 4/6 setup problems.
+
+name: dast
+
+on:
+  workflow_run:
+    workflows: [deploy-dev]   # the workflow that deploys the dev instance
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write      # for the SARIF upload
+
+concurrency:
+  group: dast                 # one scan of the target at a time; the project file is shared
+  cancel-in-progress: false
+
+env:
+  TARGET_URL: https://shop-dev.example.test/
+  TARGET_HOST: shop-dev.example.test
+  PRESET: standard
+  FAIL_ON: high
+  BRAINPROXY_VERSION: "0.4.6"
+  BRAINPROXY_SHA256: "fecbff16ac16a25c0472789e34f6c63c103bf7568e00a1ed1088a1e96431c307"
+  SERVER_REF: main            # pin to a commit of brainproxy_server for repeatable builds
+
+jobs:
+  scan:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Tools
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/brainproxy" \
+            "https://github.com/r4nd0mth1ngs/brainproxy/releases/download/v${BRAINPROXY_VERSION}/brainproxy-${BRAINPROXY_VERSION}-linux-x86_64"
+          echo "${BRAINPROXY_SHA256}  $RUNNER_TEMP/bin/brainproxy" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/brainproxy"
+          cargo install --locked --root "$RUNNER_TEMP" \
+            --git https://github.com/r4nd0mth1ngs/brainproxy_server --rev "$SERVER_REF" brainproxy-server
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # Caches can't be overwritten, so each run saves under a new key and restores the newest.
+      - name: Restore the project and run history
+        uses: actions/cache/restore@v4
+        with:
+          path: dast
+          key: dast-${{ github.run_id }}
+          restore-keys: dast-
+
+      # Explicit first-time setup: ci itself never creates a project. If the cache was evicted
+      # (7 days unused), this starts over, and every finding counts as new again.
+      - name: Create the project (first run only)
+        run: |
+          mkdir -p dast
+          if [ ! -f dast/app.bpdb ]; then
+            brainproxy --project dast/app.bpdb engagement start --target "$TARGET_HOST" --name "${{ github.repository }}"
+            # For a logged-in scan, add a profile here once, e.g.:
+            # brainproxy --project dast/app.bpdb auth add user --login-url "${TARGET_URL}login" ... \
+            #   --password-env APP_PASSWORD --check-url "${TARGET_URL}me" --logged-in 'Sign out'
+          fi
+
+      - name: Scan, compare and gate
+        id: ci
+        env:
+          APP_PASSWORD: ${{ secrets.DAST_APP_PASSWORD }}   # only if an auth profile uses it
+        run: |
+          set +e
+          brainproxy-server ci --project dast/app.bpdb --url "$TARGET_URL" --preset "$PRESET" \
+            --fail-on "$FAIL_ON" --new-only --out dast/runs --max-minutes 60   # add: --auth user
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "run=$(ls -d dast/runs/*/ | tail -n 1)" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Save the project and run history
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: dast
+          key: dast-${{ github.run_id }}
+
+      - name: Upload the run folder
+        if: always() && steps.ci.outputs.run != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-run
+          path: ${{ steps.ci.outputs.run }}
+
+      - name: Upload SARIF to code scanning
+        if: always() && hashFiles(format('{0}report.sarif', steps.ci.outputs.run)) != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ steps.ci.outputs.run }}report.sarif
+          category: dast
+
+      - name: Result
+        run: |
+          case "${{ steps.ci.outputs.code }}" in
+            0) echo "passed" ;;
+            5) echo "::error::new findings at or above $FAIL_ON (see the run folder and code scanning)"; exit 5 ;;
+            2) echo "::error::the scan is incomplete, so it can't pass (see reasons in run.json)"; exit 2 ;;
+            *) echo "::error::brainproxy-server ci exited ${{ steps.ci.outputs.code }}"; exit 1 ;;
+          esac

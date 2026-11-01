@@ -1,0 +1,50 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, against brainproxy main, to catch CLI contract changes before a release.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The CLI release the contract tests are pinned to.
+  BRAINPROXY_VERSION: "0.4.6"
+  BRAINPROXY_SHA256: "fecbff16ac16a25c0472789e34f6c63c103bf7568e00a1ed1088a1e96431c307"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cli: ${{ github.event_name == 'schedule' && fromJSON('["release", "main"]') || fromJSON('["release"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal -c rustfmt,clippy && rustup default stable
+      - name: brainproxy CLI (release)
+        if: matrix.cli == 'release'
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl -fsSL -o "$RUNNER_TEMP/bin/brainproxy" \
+            "https://github.com/r4nd0mth1ngs/brainproxy/releases/download/v${BRAINPROXY_VERSION}/brainproxy-${BRAINPROXY_VERSION}-linux-x86_64"
+          echo "${BRAINPROXY_SHA256}  $RUNNER_TEMP/bin/brainproxy" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/brainproxy"
+          echo "BRAINPROXY_BIN=$RUNNER_TEMP/bin/brainproxy" >> "$GITHUB_ENV"
+      - name: brainproxy CLI (main)
+        if: matrix.cli == 'main'
+        run: |
+          git clone --depth 1 https://github.com/r4nd0mth1ngs/brainproxy "$RUNNER_TEMP/brainproxy"
+          CARGO_TARGET_DIR="$RUNNER_TEMP/bp-target" cargo build --release --locked \
+            --manifest-path "$RUNNER_TEMP/brainproxy/Cargo.toml" -p brainproxy
+          echo "BRAINPROXY_BIN=$RUNNER_TEMP/bp-target/release/brainproxy" >> "$GITHUB_ENV"
+      - name: Checks
+        env:
+          BRAINPROXY_CONTRACT: "1"
+        run: scripts/check.sh
