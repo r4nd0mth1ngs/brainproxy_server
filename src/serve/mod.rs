@@ -222,6 +222,13 @@ impl Server {
     /// Writes an audit line to `control.db` and as JSON to stdout.
     pub fn audit(&self, mut e: AuditEntry) {
         e.time = time::now_millis();
+        // Nothing a caller sends makes an audit line long.
+        for f in [&mut e.actor, &mut e.action, &mut e.result] {
+            clip(f);
+        }
+        for f in [&mut e.target, &mut e.run, &mut e.detail].into_iter().flatten() {
+            clip(f);
+        }
         println!(
             "{}",
             json!({
@@ -258,11 +265,13 @@ impl Server {
             let value = match std::fs::read_to_string(&file) {
                 Ok(v) => OsString::from(v.trim_end_matches(['\r', '\n'])),
                 Err(_) => std::env::var_os(source).ok_or_else(|| {
-                    format!(
-                        "secret {cli_var} of target {} isn't set: no file {} and no variable {source}",
+                    // Where secrets come from stays in the server log, not in what read tokens see.
+                    eprintln!(
+                        "brainproxy-server: secret {cli_var} of target {} isn't set: no file {} and no variable {source}",
                         t.id,
                         file.display()
-                    )
+                    );
+                    format!("secret {cli_var} of target {} isn't set on the server (see its log)", t.id)
                 })?,
             };
             env.push((cli_var.into(), value));
@@ -334,7 +343,11 @@ impl Server {
         self.live
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(run.id.clone(), Live { target: run.target.clone(), cancel: tx });
+            .insert(run.id.clone(), Live { target: run.target.clone(), cancel: tx.clone() });
+        // A cancel between `mark_running` and the insert above found no live entry: read it again.
+        if self.db().run(&run.target, &run.id).ok().flatten().is_some_and(|r| r.cancel_requested) {
+            let _ = tx.send(Some("a cancel request"));
+        }
         self.bump();
         tokio::spawn(async move {
             let (id, target) = (run.id.clone(), run.target.clone());
@@ -344,9 +357,19 @@ impl Server {
                 Err(e) => End::failed(code::ERROR, format!("internal error: {e}")),
             };
             let cancelled = self.db().run(&target, &id).ok().flatten().is_some_and(|r| r.cancel_requested);
-            let state = if cancelled && end.state == state::INCOMPLETE { state::CANCELLED } else { end.state };
+            // A cancelled run never passes, even when its scan completed before the cancel reached it
+            // (the same rule as `ci`).
+            let end = if cancelled {
+                let note = match end.state {
+                    state::COMPLETED => Some("cancelled after the scan completed; not counted as a pass".to_string()),
+                    _ => end.note,
+                };
+                End { state: state::CANCELLED, outcome: "incomplete", exit: code::USAGE, note, ..end }
+            } else {
+                end
+            };
             let end = db::RunEnd {
-                state,
+                state: end.state,
                 outcome: end.outcome,
                 exit_code: end.exit,
                 run_json: end.run.as_ref(),
@@ -446,30 +469,37 @@ impl Server {
         End { state, outcome, exit: done.exit, run: serde_json::to_value(&done.run).ok(), note: None }
     }
 
-    /// `engagement check` of the base URL's host: allowed, and not resolving to this machine or a
-    /// link-local address (a registered name pointed at the server itself would reach its admin port).
+    /// `engagement check` of the base URL's host and every other host name in the scope: allowed,
+    /// and not resolving to this machine or a link-local address (a registered name pointed at the
+    /// server itself would reach its admin port).
     async fn check_host(&self, cli: &Cli, t: &TargetConfig) -> Result<(), (i32, String)> {
         let (host, port) = target::url_host_port(&t.base_url).map_err(|e| (code::USAGE, e))?;
-        let host = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
-        let out = cli
-            .run(["engagement", "check", &host])
-            .await
-            .map_err(|e| (code::ERROR, format!("can't run {}: {e}", cli.bin.display())))?;
-        if !out.ok() {
-            return Err((
-                if out.code == code::OK { code::ERROR } else { out.code },
-                format!("engagement check: {}", out.message()),
-            ));
+        let base = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+        let mut names = vec![(base, true)];
+        for s in &t.scope {
+            if let Ok(ScopeEntry::Host { name, port }) = ScopeEntry::parse(s, true) {
+                names.push((format!("{name}:{}", port.unwrap_or(443)), false));
+            }
         }
-        let result = &out.data()["results"][0];
-        if result["allowed"] != true {
-            let why = result["reason"].as_str().unwrap_or("not allowed");
-            return Err((code::OUT_OF_SCOPE, format!("{host}: {why}")));
-        }
-        for a in result["addresses"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-            let Ok(ip) = a.parse::<std::net::IpAddr>() else { continue };
-            if let Err(e) = target::check_ip(ip, self.cfg.allow_loopback_targets) {
-                return Err((code::OUT_OF_SCOPE, format!("{host} resolves to {ip}: {e}")));
+        for (name, must_be_allowed) in names {
+            let out = cli
+                .run(["engagement", "check", &name])
+                .await
+                .map_err(|e| (code::ERROR, format!("can't run {}: {e}", cli.bin.display())))?;
+            if !out.ok() {
+                let c = if out.code == code::OK { code::ERROR } else { out.code };
+                return Err((c, format!("engagement check: {}", out.message())));
+            }
+            let result = &out.data()["results"][0];
+            if must_be_allowed && result["allowed"] != true {
+                let why = result["reason"].as_str().unwrap_or("not allowed");
+                return Err((code::OUT_OF_SCOPE, format!("{name}: {why}")));
+            }
+            for a in result["addresses"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let Ok(ip) = a.parse::<std::net::IpAddr>() else { continue };
+                if let Err(e) = target::check_ip(ip, self.cfg.allow_loopback_targets) {
+                    return Err((code::OUT_OF_SCOPE, format!("{name} resolves to {ip}: {e}")));
+                }
             }
         }
         Ok(())
@@ -628,6 +658,32 @@ impl Server {
         if eng.data()["engagement_proxies"].as_array().is_some_and(|p| !p.is_empty()) {
             return Err(ApiError::invalid("the project allows upstream proxies; the server doesn't accept those"));
         }
+        // Connection settings the CLI applies on top of the scope: an upstream proxy (allowed on
+        // loopback by the CLI) or a host override to an address the scope doesn't list would send
+        // the scan somewhere the registration never named.
+        let conn = cli_ok(&cli, ["connection", "show"]).await?;
+        let c = conn.data();
+        if c["upstream"].as_array().is_some_and(|u| !u.is_empty()) {
+            return Err(ApiError::invalid(
+                "the project has upstream proxies (`connection upstream`); the server doesn't accept those",
+            ));
+        }
+        let entries: Vec<ScopeEntry> =
+            t.scope.iter().filter_map(|s| ScopeEntry::parse(s, self.cfg.allow_loopback_targets).ok()).collect();
+        for h in c["hosts"].as_array().into_iter().flatten() {
+            let ip_text = h["ip"].as_str().unwrap_or_default();
+            let listed = ip_text.parse::<std::net::IpAddr>().ok().filter(|ip| {
+                target::check_ip(*ip, self.cfg.allow_loopback_targets).is_ok()
+                    && entries.iter().any(|e| e.covers_addr(*ip))
+            });
+            if listed.is_none() {
+                return Err(ApiError::invalid(format!(
+                    "the project maps {} to {ip_text}, an address the target's scope doesn't list",
+                    h["host"].as_str().unwrap_or("?")
+                ))
+                .with_kind("out_of_scope"));
+            }
+        }
         let profiles = cli_ok(&cli, ["auth", "list"]).await?;
         let mut names = Vec::new();
         for p in profiles.data()["profiles"].as_array().into_iter().flatten() {
@@ -697,6 +753,17 @@ impl Server {
         })();
         self.busy.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
         result
+    }
+}
+
+fn clip(s: &mut String) {
+    if s.len() > 300 {
+        let mut end = 300;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+        s.push('…');
     }
 }
 

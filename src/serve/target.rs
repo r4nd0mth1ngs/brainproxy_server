@@ -334,7 +334,11 @@ impl ScopeEntry {
                 return Err("the address has bits set beyond the prefix".into());
             }
             check_ip(IpAddr::V4(net), allow_loopback)?;
-            return Ok(ScopeEntry::Cidr { net, bits });
+            let entry = ScopeEntry::Cidr { net, bits };
+            if METADATA_V4.iter().any(|m| entry.covers_addr(IpAddr::V4(*m))) {
+                return Err("the network contains a cloud metadata address".into());
+            }
+            return Ok(entry);
         }
         let (host, port) = split_host_port(&s)?;
         if let Ok(addr) = host.parse::<IpAddr>() {
@@ -362,6 +366,15 @@ impl ScopeEntry {
             return Err("cloud metadata hosts can't be targets".into());
         }
         Ok(ScopeEntry::Host { name: host, port })
+    }
+
+    /// The entry lists this address (by address or network, whatever its port).
+    pub fn covers_addr(&self, ip: IpAddr) -> bool {
+        match self {
+            ScopeEntry::Host { .. } => false,
+            ScopeEntry::Ip { addr, .. } => *addr == ip,
+            ScopeEntry::Cidr { .. } => self.covers(&ip.to_string(), 0),
+        }
     }
 
     /// The entry allows this exact host and port.
@@ -392,6 +405,9 @@ impl std::fmt::Display for ScopeEntry {
     }
 }
 
+/// Cloud metadata services outside link-local space (Alibaba Cloud).
+const METADATA_V4: [Ipv4Addr; 1] = [Ipv4Addr::new(100, 100, 100, 200)];
+
 /// Refuses addresses no target may have (loopback unless allowed, link-local, metadata, ...).
 pub fn check_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
     let refused = match addr {
@@ -403,6 +419,8 @@ pub fn check_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
                 Some("loopback")
             } else if a.is_link_local() {
                 Some("link-local (cloud metadata)")
+            } else if METADATA_V4.contains(&a) {
+                Some("cloud metadata")
             } else if a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.octets()[0] == 0 {
                 Some("not a host address")
             } else {
@@ -410,8 +428,18 @@ pub fn check_ip(addr: IpAddr, allow_loopback: bool) -> Result<(), String> {
             }
         }
         IpAddr::V6(a) => {
+            let seg = a.segments();
+            let embedded = |s: &[u16]| Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
             if let Some(v4) = a.to_ipv4_mapped() {
                 return check_ip(IpAddr::V4(v4), allow_loopback);
+            }
+            // NAT64 (64:ff9b::/96) carries an IPv4 address that a gateway connects to.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return check_ip(IpAddr::V4(embedded(&seg)), allow_loopback);
+            }
+            // The deprecated IPv4-compatible form (::a.b.c.d); nothing should use it.
+            if seg[..6] == [0; 6] && !a.is_loopback() && !a.is_unspecified() {
+                return Err("IPv4-compatible IPv6 addresses can't be targets".into());
             }
             let metadata = Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254);
             if a.is_loopback() {
@@ -499,6 +527,11 @@ mod tests {
             "localhost:3000",
             "[::1]",
             "[::ffff:127.0.0.1]",
+            "[64:ff9b::7f00:1]",
+            "[64:ff9b::a9fe:a9fe]",
+            "[::7f00:1]",
+            "100.100.100.200",
+            "100.100.100.0/24",
             "0.0.0.0",
             "metadata.google.internal",
             "a b",

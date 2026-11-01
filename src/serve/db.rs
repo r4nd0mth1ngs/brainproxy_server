@@ -112,6 +112,8 @@ pub struct RunRow {
     pub started: Option<i64>,
     pub finished: Option<i64>,
     pub actor: String,
+    /// Who may be answered with this run on a repeated trigger: the token id, or `admin`.
+    pub owner: String,
     pub cancel_requested: bool,
     pub baseline: bool,
     pub accept_coverage_drop: bool,
@@ -122,7 +124,7 @@ pub struct RunRow {
 }
 
 const RUN_COLUMNS: &str = "id, seq, target, commit_sha, git_ref, pipeline_url, preset, state, outcome, exit_code, \
-     job, created, started, finished, actor, cancel_requested, baseline, accept_coverage_drop, run_json, note";
+     job, created, started, finished, actor, cancel_requested, baseline, accept_coverage_drop, run_json, note, owner";
 
 fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
     let run_json: Option<String> = r.get(18)?;
@@ -147,6 +149,7 @@ fn run_row(r: &Row) -> rusqlite::Result<RunRow> {
         accept_coverage_drop: r.get(17)?,
         run_json: run_json.and_then(|t| serde_json::from_str(&t).ok()),
         note: r.get(19)?,
+        owner: r.get(20)?,
     })
 }
 
@@ -204,18 +207,19 @@ impl Db {
                 started INTEGER,
                 finished INTEGER,
                 actor TEXT NOT NULL,
+                owner TEXT NOT NULL,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 baseline INTEGER NOT NULL DEFAULT 0,
                 accept_coverage_drop INTEGER NOT NULL DEFAULT 0,
                 run_json TEXT,
                 note TEXT
             );
-            -- One running and one queued run per target, and one live run per commit: of two racing
-            -- triggers exactly one inserts.
+            -- One running and one queued run per target, and one live run per caller, commit and
+            -- preset: of two racing triggers exactly one inserts.
             CREATE UNIQUE INDEX IF NOT EXISTS runs_one_running ON runs(target) WHERE state = 'running';
             CREATE UNIQUE INDEX IF NOT EXISTS runs_one_queued ON runs(target) WHERE state = 'queued';
-            CREATE UNIQUE INDEX IF NOT EXISTS runs_live_commit ON runs(target, commit_sha)
-                WHERE state IN ('queued', 'running') AND commit_sha IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS runs_live_commit ON runs(target, owner, commit_sha, preset)
+                WHERE state IN ('queued', 'running') AND commit_sha IS NOT NULL AND baseline = 0;
             CREATE INDEX IF NOT EXISTS runs_target ON runs(target, seq);
 
             CREATE TABLE IF NOT EXISTS idempotency (
@@ -270,9 +274,14 @@ impl Db {
         Ok(())
     }
 
-    pub fn delete_target(&self, id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM targets WHERE id = ?1", [id])?;
-        Ok(())
+    /// Removes a target with its tokens (cascade), runs and idempotency keys, so a target
+    /// registered again under the same id starts with no history.
+    pub fn delete_target(&mut self, id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM idempotency WHERE run IN (SELECT id FROM runs WHERE target = ?1)", [id])?;
+        tx.execute("DELETE FROM runs WHERE target = ?1", [id])?;
+        tx.execute("DELETE FROM targets WHERE id = ?1", [id])?;
+        tx.commit()
     }
 
     pub fn target(&self, id: &str) -> Result<Option<Target>> {
@@ -382,16 +391,26 @@ impl Db {
         rows.collect()
     }
 
-    /// A live run of this commit, or a completed one finished after `since`.
-    pub fn run_for_commit(&self, target: &str, commit: &str, since: i64) -> Result<Option<RunRow>> {
+    /// The run that answers a repeated trigger: one of the same caller, commit and preset, live or
+    /// completed after `since`. Never a baseline run (it had no gate), never another caller's (the
+    /// commit is only a label the caller chose: another pipeline's run proves nothing about this one).
+    pub fn run_for_commit(
+        &self,
+        target: &str,
+        owner: &str,
+        commit: &str,
+        preset: &str,
+        since: i64,
+    ) -> Result<Option<RunRow>> {
         self.conn
             .query_row(
                 &format!(
-                    "SELECT {RUN_COLUMNS} FROM runs WHERE target = ?1 AND commit_sha = ?2
-                     AND (state IN ('queued', 'running') OR (state = 'completed' AND finished >= ?3))
+                    "SELECT {RUN_COLUMNS} FROM runs WHERE target = ?1 AND owner = ?2 AND commit_sha = ?3
+                     AND preset = ?4 AND baseline = 0
+                     AND (state IN ('queued', 'running') OR (state = 'completed' AND finished >= ?5))
                      ORDER BY seq DESC LIMIT 1"
                 ),
-                params![target, commit, since],
+                params![target, owner, commit, preset, since],
                 run_row,
             )
             .optional()
@@ -425,7 +444,7 @@ impl Db {
         }
         tx.execute(
             "INSERT INTO runs (id, target, commit_sha, git_ref, pipeline_url, preset, state, created, actor,
-             baseline, accept_coverage_drop) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
+             baseline, accept_coverage_drop, owner) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?11)",
             params![
                 run.id,
                 run.target,
@@ -436,7 +455,8 @@ impl Db {
                 run.created,
                 run.actor,
                 run.baseline,
-                run.accept_coverage_drop
+                run.accept_coverage_drop,
+                run.owner
             ],
         )?;
         if let Some((token, key)) = idempotency {
@@ -483,25 +503,27 @@ impl Db {
     }
 
     /// A queued run becomes cancelled; a running one is marked so its worker ends it as cancelled.
-    /// Returns the run's state before.
+    /// Returns the run's state before. Each step is conditional on the state, so a run that starts
+    /// meanwhile is still marked.
     pub fn request_cancel(&self, target: &str, id: &str, now: i64) -> Result<Option<String>> {
-        let Some(before) = self
-            .conn
-            .query_row("SELECT state FROM runs WHERE target = ?1 AND id = ?2", [target, id], |r| r.get::<_, String>(0))
-            .optional()?
-        else {
-            return Ok(None);
-        };
-        if before == state::QUEUED {
-            self.conn.execute(
-                "UPDATE runs SET state = 'cancelled', outcome = 'incomplete', exit_code = 2, finished = ?2,
-                 note = 'cancelled before it started' WHERE id = ?1 AND state = 'queued'",
-                params![id, now],
-            )?;
-        } else if before == state::RUNNING {
-            self.conn.execute("UPDATE runs SET cancel_requested = 1 WHERE id = ?1", [id])?;
+        let n = self.conn.execute(
+            "UPDATE runs SET state = 'cancelled', outcome = 'incomplete', exit_code = 2, finished = ?3,
+             note = 'cancelled before it started' WHERE target = ?1 AND id = ?2 AND state = 'queued'",
+            params![target, id, now],
+        )?;
+        if n > 0 {
+            return Ok(Some(state::QUEUED.into()));
         }
-        Ok(Some(before))
+        let n = self.conn.execute(
+            "UPDATE runs SET cancel_requested = 1 WHERE target = ?1 AND id = ?2 AND state = 'running'",
+            [target, id],
+        )?;
+        if n > 0 {
+            return Ok(Some(state::RUNNING.into()));
+        }
+        self.conn
+            .query_row("SELECT state FROM runs WHERE target = ?1 AND id = ?2", [target, id], |r| r.get(0))
+            .optional()
     }
 
     pub fn live_runs_of(&self, target: &str) -> Result<usize> {

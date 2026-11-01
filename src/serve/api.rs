@@ -201,19 +201,23 @@ fn authenticate(
     need: Perm,
 ) -> Result<Caller, ApiError> {
     let s = &app.server;
-    let key = ip.to_string();
-    if !s.limits.check(Bucket::AuthFailure, &key) {
-        return Err(ApiError::too_many("too many failed authentications from this address; try again later"));
-    }
+    // Failed attempts are counted per address and listener. Valid credentials always get through,
+    // so nobody can lock pipelines or the admin out by failing on purpose from a shared address
+    // (a reverse proxy on this machine, a CI NAT); tokens are 256-bit, so the limit only bounds
+    // noise and audit writes.
+    let key = format!("{}:{ip}", if app.admin { "admin" } else { "public" });
     let presented = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(auth::bearer);
     let fail = |why: &str| {
-        s.limits.take(Bucket::AuthFailure, &key);
+        if !s.limits.take(Bucket::AuthFailure, &key) {
+            return ApiError::too_many("too many failed authentications from this address; try again later");
+        }
+        let named = presented.and_then(auth::token_target).filter(|t| target::valid_id(t));
         s.audit(AuditEntry {
-            actor: presented.and_then(auth::token_target).map_or("unknown".into(), |t| format!("a token for {t}")),
+            actor: named.map_or("unknown".into(), |t| format!("a token for {t}")),
             actor_kind: "none".into(),
-            ip: Some(key.clone()),
+            ip: Some(ip.to_string()),
             action: "authenticate".into(),
-            target: target.map(String::from),
+            target: target.filter(|t| target::valid_id(t)).map(String::from),
             result: "refused".into(),
             detail: Some(why.into()),
             ..AuditEntry::default()
@@ -455,7 +459,7 @@ async fn download(
     let ip = client_ip(&app, peer, &headers);
     let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
     let content_type = match file.as_str() {
-        "report.json" | "run.json" | "compare.json" => "application/json",
+        "report.json" | "compare.json" => "application/json",
         "report.html" => "text/html; charset=utf-8",
         "report.sarif" => "application/sarif+json",
         _ => return Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such file")),
@@ -588,7 +592,7 @@ async fn trigger(
         }
     }
     let by_commit = match &b.commit {
-        Some(c) => s.db().run_for_commit(&t, c, now - DEDUP_MS).map_err(ApiError::db)?,
+        Some(c) => s.db().run_for_commit(&t, &owner, c, &preset, now - DEDUP_MS).map_err(ApiError::db)?,
         None => None,
     };
     if let Some(row) = by_commit
@@ -604,7 +608,7 @@ async fn trigger(
         commit: b.commit.clone(),
         git_ref: b.git_ref.clone(),
         pipeline_url: b.pipeline_url.clone(),
-        preset,
+        preset: preset.clone(),
         state: state::QUEUED.into(),
         outcome: None,
         exit_code: None,
@@ -613,6 +617,7 @@ async fn trigger(
         started: None,
         finished: None,
         actor: caller.audit(ip, "").actor,
+        owner: owner.clone(),
         cancel_requested: false,
         baseline: target.next_baseline,
         accept_coverage_drop: target.next_accept_coverage_drop,
@@ -625,7 +630,7 @@ async fn trigger(
         Err(rusqlite::Error::SqliteFailure(f, _)) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
             // A racing trigger of the same commit won: answer with its run.
             let won = match &b.commit {
-                Some(c) => s.db().run_for_commit(&t, c, now - DEDUP_MS).map_err(ApiError::db)?,
+                Some(c) => s.db().run_for_commit(&t, &owner, c, &preset, now - DEDUP_MS).map_err(ApiError::db)?,
                 None => None,
             };
             if let Some(won) = won {
@@ -824,6 +829,8 @@ async fn upload(
     }
     let dir = app.server.target_dir(&t).join(format!(".upload-{}", auth::base32(&auth::random_bytes::<5>())));
     tokio::fs::create_dir_all(&dir).await.map_err(ApiError::io)?;
+    // Removed however this ends, also when the client goes away mid-upload and hyper drops us.
+    let _cleanup = RemoveOnDrop(dir.clone());
     let file = dir.join("upload.bpdb");
     let written = async {
         let mut out = tokio::fs::File::create(&file).await.map_err(ApiError::io)?;
@@ -858,6 +865,14 @@ async fn upload(
     }
     app.server.audit(e);
     ok(StatusCode::OK, result?)
+}
+
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[derive(Deserialize, Default)]

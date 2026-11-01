@@ -322,6 +322,22 @@ fn at_most_ten_targets() {
     assert_eq!(s.admin("DELETE", "/v1/targets/t3", None).0, 200);
     assert_eq!(s.get_public("/v1/targets/t3/runs", Some(&tok)).0, 401);
     s.register("t10", &app, json!({}));
+    // A target registered again under a removed id starts without the old one's runs.
+    app.state.delay_ms.store(1500, Ordering::SeqCst);
+    let (_, _) = s.trigger("t4", &s.token("t4", "trigger"), json!({"commit": "old"}));
+    assert_eq!(s.admin("DELETE", "/v1/targets/t4", None).0, 409, "removed with a live run");
+    let (_, runs) = s.admin("GET", "/v1/targets/t4/runs", None);
+    let r = runs["data"]["runs"][0]["run"].as_str().unwrap().to_string();
+    s.admin("POST", &format!("/v1/targets/t4/runs/{r}/cancel"), None);
+    let start = Instant::now();
+    while s.admin("DELETE", "/v1/targets/t4", None).0 != 200 {
+        assert!(start.elapsed() < Duration::from_secs(60), "t4 never became removable");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    app.state.delay_ms.store(0, Ordering::SeqCst);
+    s.register("t4", &app, json!({}));
+    let (_, runs) = s.admin("GET", "/v1/targets/t4/runs", None);
+    assert_eq!(runs["data"]["runs"], json!([]), "{runs}");
     let scope: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.path().join("work/system-scope.json")).unwrap()).unwrap();
     assert_eq!(scope["include"], json!([app.host()]));
@@ -437,6 +453,31 @@ fn uploaded_projects_are_checked() {
     let (status, v) = upload(&s, "up", std::fs::read(&literal).unwrap());
     assert_eq!(status, 400, "{v}");
     assert!(v["error"]["message"].as_str().unwrap().contains("password"), "{v}");
+
+    // Connection settings that send traffic past the scope: an upstream proxy, a host override.
+    let proxied = make_project(
+        &cli,
+        p,
+        "proxied.bpdb",
+        &[
+            &["engagement", "start", "--target", &app.host()],
+            &["connection", "upstream", "add", "--host", "*", "--proxy", "http://127.0.0.1:9"],
+        ],
+    );
+    let (status, v) = upload(&s, "up", std::fs::read(&proxied).unwrap());
+    assert_eq!(status, 400, "{v}");
+    let pinned = make_project(
+        &cli,
+        p,
+        "pinned.bpdb",
+        &[
+            &["engagement", "start", "--target", &app.host()],
+            &["connection", "hosts", "add", "evil.test", "203.0.113.7"],
+        ],
+    );
+    let (status, v) = upload(&s, "up", std::fs::read(&pinned).unwrap());
+    assert_eq!(status, 400, "{v}");
+    assert_eq!(v["error"]["kind"], "out_of_scope", "{v}");
 
     let missing = make_project(&cli, p, "noauth.bpdb", &[&["engagement", "start", "--target", &app.host()]]);
     let (status, v) = upload(&s, "up", std::fs::read(&missing).unwrap());
@@ -604,6 +645,16 @@ fn remote_run_exit_codes_drift_and_reports() {
             .any(|f| f["alert_ref"].as_str().unwrap().starts_with("40018"))
     );
 
+    // Another pipeline's token sending the same commit gets a scan of its own, not run 2's verdict;
+    // nor does the baseline run's commit answer a gated trigger.
+    let other = s.token("shop", "trigger");
+    let (status, v) = s.trigger("shop", &other, json!({"commit": "c2"}));
+    assert_eq!(status, 202, "deduplicated across tokens: {v}");
+    s.wait_run("shop", &run_id(&v), &other);
+    let (status, v) = s.trigger("shop", &tok, json!({"commit": "c1"}));
+    assert_eq!(status, 202, "deduplicated to the baseline run: {v}");
+    s.wait_run("shop", &run_id(&v), &tok);
+
     // 3: fixed again: passes; `latest` is this run.
     app.state.drift.store(false, Ordering::SeqCst);
     let (code, r3) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c3"]);
@@ -743,11 +794,19 @@ fn rate_limits() {
     let app = App::start(0);
     s.register("rl", &app, json!({}));
     let tok = s.token("rl", "trigger");
-    // 30 failed authentications from one address, then 429 even for a good token.
+    // 30 failed authentications from one address, then 429 for more; a valid token (or the admin,
+    // on its own listener) is never locked out by someone failing from the same address.
     for _ in 0..30 {
         assert_eq!(s.get_public("/v1/targets/rl", Some("bpt_rl_nope")).0, 401);
     }
-    assert_eq!(s.get_public("/v1/targets/rl", Some(&tok)).0, 429);
+    assert_eq!(s.get_public("/v1/targets/rl", Some("bpt_rl_nope")).0, 429);
+    assert_eq!(s.get_public("/v1/targets/rl", Some(&tok)).0, 200);
+    assert_eq!(s.admin("GET", "/v1/summary", None).0, 200);
+    // Caller-chosen text in a refused token doesn't make audit lines long.
+    let long = format!("bpt_{}_{}", "x".repeat(5000), "a".repeat(52));
+    s.get_public("/v1/targets/rl", Some(&long));
+    let (_, audit) = s.admin("GET", "/v1/audit?limit=1000", None);
+    assert!(audit.to_string().len() < 100_000, "{} bytes", audit.to_string().len());
 }
 
 #[test]

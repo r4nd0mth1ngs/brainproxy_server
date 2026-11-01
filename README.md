@@ -94,19 +94,24 @@ and gate); a pipeline then only names the target and gets a verdict.
   the scope and pass `engagement check`, and its host must not resolve to this machine (checked
   again before every run). The project's engagement scope is write-once. The server writes the
   union of all targets' scopes to a system scope file the CLI enforces on top
-  (`BRAINPROXY_SYSTEM_SCOPE`). Add an egress firewall to the targets' addresses.
+  (`BRAINPROXY_SYSTEM_SCOPE`). Add an egress firewall to the targets' addresses; in a container
+  that also keeps a re-pointed target name away from the server's own bridge address, where the
+  admin port listens (it still needs the admin token).
 - **Secrets.** A target's `secret_env` maps the variables its auth profile reads to files
   `--secrets-dir/<target>/<VARIABLE>` (Docker and Kubernetes secrets) or the server's environment.
   Every CLI process gets a cleared environment with a small allowlist plus its own target's secrets.
 - **Queue.** One running and one queued run per target, at most `--max-parallel` (3) scans. A newer
-  trigger replaces the queued run, which ends as `superseded`. A trigger with the same `commit`
-  within 24 hours, or the same `Idempotency-Key`, returns the existing run. A restart waits for
+  trigger replaces the queued run, which ends as `superseded`. A trigger from the same token with the
+  same `commit` and preset within 24 hours, or the same `Idempotency-Key`, returns the existing run
+  (never another token's run, and never a baseline run: a commit is only a label the caller chose). A restart waits for
   running scans again (in a container a restart also ends them: those runs end incomplete).
 - **Outcome rules** are those of `ci`: anything cut short, cancelled, superseded, with a broken
-  login or collapsed coverage is incomplete (exit 2), never a pass. A snapshot of the project is
+  login or collapsed coverage is incomplete (exit 2), never a pass; so is a run cancelled after its
+  scan completed. A snapshot of the project is
   kept after each completed run (`--keep-snapshots`, 5).
-- **Limits.** At most 10 targets (compiled in). Per token: 10 triggers and 600 requests an hour;
-  30 failed authentications per address per 10 minutes. Bodies 64 KB; uploads `--max-project-mb`.
+- **Limits.** At most 10 targets (compiled in). Per token: 10 triggers and 600 requests an hour.
+  Failed authentications: 30 per address and listener per 10 minutes, then 429; valid credentials
+  are never refused for others' failures. Bodies 64 KB; uploads `--max-project-mb`.
 - **Audit log.** Registrations, tokens, uploads, triggers, cancels, downloads and refused
   authentications, in `control.db` and as JSON lines on stdout.
 - **Storage.** `--work` (default `/work`) must be local disk: the server refuses NFS, SMB and FUSE.
@@ -132,8 +137,9 @@ curl -H "$ADMIN" http://127.0.0.1:9091/v1/targets/shop-dev/next-run -d '{"baseli
 Instead of a generated project, a target can take one built in the brainproxy app (recorded login,
 macros): register it with `"project": "upload"` and `"auth_profile"`, then
 `curl -H "$ADMIN" -T app.bpdb http://127.0.0.1:9091/v1/targets/shop-dev/project`. The upload is
-refused unless its scope is inside the registered one, it allows no upstream proxies, and no
-profile stores a password in the file.
+refused unless its scope is inside the registered one, it has no upstream proxies (engagement or
+`connection upstream`), its host overrides (`connection hosts`) point only at addresses the scope
+lists, and no profile stores a password in the file.
 
 ### Endpoints
 

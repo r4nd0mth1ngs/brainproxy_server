@@ -129,21 +129,21 @@ impl Limits {
         self.update(bucket, key, true)
     }
 
-    /// The bucket still has one left, without taking it.
-    pub fn check(&self, bucket: Bucket, key: &str) -> bool {
-        self.update(bucket, key, false)
-    }
-
     fn update(&self, bucket: Bucket, key: &str, take: bool) -> bool {
         let (capacity, per) = bucket.limit();
         let now = Instant::now();
         let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() > 10_000 {
-            // Many client addresses: drop the full buckets rather than grow without end.
+            // Many client addresses: drop the full buckets rather than grow without end, and if
+            // that isn't enough (a flood from many addresses), start over: forgetting counts is
+            // better than scanning a huge map on every request.
             map.retain(|(b, _), (n, t)| {
                 let (cap, per) = b.limit();
                 *n + now.duration_since(*t).as_secs_f64() * cap / per.as_secs_f64() < cap
             });
+            if map.len() > 10_000 {
+                map.clear();
+            }
         }
         let (tokens, last) = map.entry((bucket, key.to_string())).or_insert((capacity, now));
         *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * capacity / per.as_secs_f64()).min(capacity);
@@ -203,8 +203,7 @@ mod tests {
             assert!(l.take(Bucket::Trigger, "t"));
         }
         assert!(!l.take(Bucket::Trigger, "t"));
-        assert!(!l.check(Bucket::Trigger, "t"));
         assert!(l.take(Bucket::Trigger, "other"));
-        assert!(l.check(Bucket::AuthFailure, "1.2.3.4"));
+        assert!(l.take(Bucket::AuthFailure, "1.2.3.4"));
     }
 }

@@ -202,6 +202,12 @@ impl Ci {
             return Err((code::USAGE, "the run's scan hadn't started".into()));
         }
         let mut ci = Ci::prepare(args, opts, false).await?;
+        // The same job, not one with the same id in a project file replaced meanwhile.
+        let job = run.job.clone().unwrap_or_default();
+        let status = call(&ci.cli, ["job".into(), "status".into(), job.id.to_string()]).await?;
+        if !status.ok() || status.data()["time"].as_str() != Some(job.time.as_str()) {
+            return Err((code::USAGE, format!("job {} isn't the run's job any more", job.id)));
+        }
         ci.run = Run { reasons: run.reasons.clone(), ..run };
         ci.run.reasons.push("the server restarted during the scan; it waited for the scan again".into());
         ci.resumed = true;
