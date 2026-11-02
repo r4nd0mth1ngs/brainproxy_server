@@ -5,6 +5,11 @@
 # pipeline variable (or in a variable group) named BRAINPROXY_TOKEN. Secret variables don't reach
 # scripts on their own: the Scan step maps it with `env`.
 #
+# The server also accepts Azure DevOps OIDC tokens (--oidc-issuer azure=ISSUER,JWKS_URL, a binding on
+# the service connection's `sub`), but getting one needs a workload-identity service connection,
+# and every receiver of that connection's tokens accepts them (the audience is fixed). A target
+# token is the simpler choice here.
+#
 # Exit codes of `remote run`:
 #   0 passed
 #   5 the gate failed (new findings at or above the target's fail_on risk)

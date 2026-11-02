@@ -5,6 +5,14 @@
 # protected CI/CD variable named BRAINPROXY_TOKEN (Settings > CI/CD > Variables). GitLab puts it in
 # the job's environment; remote run reads it from there.
 #
+# Or, with no stored secret: if the server runs with --oidc-issuer gitlab=https://gitlab.example.test
+# and the target binds this project (PATCH /v1/targets/<id> {"oidc": [{"issuer":
+# "https://gitlab.example.test", "claims": {"project_id": "<id>", "ref_protected": "true"}}]}), add
+#   id_tokens:
+#     BRAINPROXY_TOKEN:
+#       aud: https://scan.corp.test   # the server's --oidc-audience
+# to the job: GitLab then puts a short-lived signed token in BRAINPROXY_TOKEN instead.
+#
 # Exit codes of `remote run`:
 #   0 passed
 #   5 the gate failed (new findings at or above the target's fail_on risk)
