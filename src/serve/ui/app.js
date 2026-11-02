@@ -101,7 +101,13 @@
   function gateLine(g) {
     if (!g || typeof g !== 'object') return '';
     const what = g.new_only ? 'new finding(s)' : 'finding(s)';
-    return `${g.passed ? 'passed' : 'failed'}: ${g.count ?? 0} ${what} at or above ${g.fail_on}`;
+    const by = g.fail_on ? `at or above ${g.fail_on}` : 'failed by the alert policy';
+    let line = `${g.passed ? 'passed' : 'failed'}: ${g.count ?? 0} ${what} ${by}`;
+    const p = g.policy;
+    if (p && typeof p === 'object') {
+      line += `; policy: ${p.ignored ?? 0} ignored, ${p.warned ?? 0} warned, ${p.forced ?? 0} failed by rule`;
+    }
+    return line;
   }
 
   /// Only http(s) links, never javascript: or data:.
