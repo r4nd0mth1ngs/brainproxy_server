@@ -9,17 +9,23 @@
 #
 # Runs as UID 1000 and writes only under /work, so it works with a read-only root filesystem.
 # HOME and BRAINPROXY_HOME for the CLI are set by the server, under /work.
+#
+# CARGO_FEATURES picks optional server features, e.g. object storage for Fargate, Azure Container
+# Apps or Kubernetes backups (--store):
+#   docker build -f docker/server.Dockerfile --build-arg CARGO_FEATURES=object-store -t brainproxy-server .
 
 ARG BRAINPROXY_VERSION=0.4.6
 ARG BRAINPROXY_SHA256_X86_64=fecbff16ac16a25c0472789e34f6c63c103bf7568e00a1ed1088a1e96431c307
 ARG BRAINPROXY_SHA256_ARM64=fca89ad6a3e3406dd17d3e136405b6bb00a05e8d3b03c0b3c56fe687832d3fd1
+ARG CARGO_FEATURES=""
 
 # The server, as a static musl binary like the CLI. The same images as brainproxy's own Dockerfile.
 FROM rust:1.99.1-alpine3.24@sha256:7e9e2d068a107a2adafd19930011178d14a78326053cd4c3a9f7ad3fd049557d AS build
+ARG CARGO_FEATURES
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release --locked
+RUN cargo build --release --locked ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # The CLI release binary.
 FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS cli
