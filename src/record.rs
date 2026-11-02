@@ -77,6 +77,22 @@ pub struct Gate {
     pub new_only: bool,
     pub passed: bool,
     pub count: u64,
+    /// Set when an alert policy applied (the gate was then worked out here, not by the CLI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyResult>,
+}
+
+/// What an alert policy did to the gate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PolicyResult {
+    /// Findings left out by `ignore` rules.
+    pub ignored: u64,
+    /// Findings listed by `warn` rules, which never fail the gate.
+    pub warned: u64,
+    /// Findings that failed the gate by a `fail` rule though their risk was below `fail_on`.
+    pub forced: u64,
+    /// The first warned findings, for people.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,6 +109,9 @@ pub struct Run {
     pub max_minutes: Option<u64>,
     #[serde(default)]
     pub rate: Option<u32>,
+    /// Fingerprint of the alert policy the run was gated under (`policy::fingerprint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub job: Option<Job>,
@@ -168,9 +187,13 @@ pub fn since_scan_candidates<'a>(history: &'a [Past], now: &'a Run) -> impl Iter
     })
 }
 
-/// `past`'s gate was at least as strict as `now`'s: a risk at or below it, and `--new-only` only if
-/// `now` has it too. No gate now: anything goes.
+/// `past`'s gate was at least as strict as `now`'s: the same alert policy, a risk at or below it,
+/// and `--new-only` only if `now` has it too. No gate now: anything goes. A changed policy starts
+/// over, since rules can loosen as well as tighten the gate.
 fn gate_as_strict(past: &Run, now: &Run) -> bool {
+    if past.policy != now.policy {
+        return false;
+    }
     let Some(want) = now.fail_on.as_deref() else { return true };
     let Some(had) = past.fail_on.as_deref() else { return false };
     risk_rank(had) <= risk_rank(want) && (!past.new_only || now.new_only)
@@ -233,6 +256,7 @@ mod tests {
             auth: None,
             max_minutes: None,
             rate: None,
+            policy: None,
             started_at: String::new(),
             finished_at: None,
             job: Some(Job { id: job, time: format!("t{job}"), ..Job::default() }),

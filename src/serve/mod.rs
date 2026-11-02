@@ -15,6 +15,7 @@
 pub mod api;
 pub mod auth;
 pub mod db;
+pub mod oidc;
 pub mod target;
 
 use std::collections::{HashMap, HashSet};
@@ -55,6 +56,38 @@ pub struct Config {
     pub allow_loopback_targets: bool,
     /// Take the client address from the last `X-Forwarded-For` entry (behind a reverse proxy).
     pub trust_forwarded: bool,
+    /// OIDC issuers whose CI tokens targets may bind.
+    pub oidc_issuers: Vec<oidc::Issuer>,
+    /// The `aud` OIDC tokens must carry: the server's public URL.
+    pub oidc_audience: Option<String>,
+}
+
+/// What `PATCH /v1/targets/{t}` may change.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPatch {
+    pub oidc: Option<Vec<oidc::Binding>>,
+    pub policy: Option<crate::policy::Policy>,
+    pub ownership: Option<bool>,
+}
+
+/// GETs a small text file over HTTP(S): no redirects, 10 s, 4 KB. Certificates aren't checked:
+/// dev instances often have self-signed ones, nothing secret is sent, and the ownership check
+/// guards against typos, not attackers.
+fn fetch_small(url: &str) -> Result<String, String> {
+    let tls = ureq::tls::TlsConfig::builder().disable_verification(true).build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .tls_config(tls)
+        .build()
+        .into();
+    let mut resp = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?;
+    if resp.status() != 200 {
+        return Err(format!("{url}: HTTP {}", resp.status()));
+    }
+    resp.body_mut().with_config().limit(4096).read_to_string().map_err(|e| format!("{url}: {e}"))
 }
 
 /// How long an `Idempotency-Key` answers a repeated trigger with its run.
@@ -71,6 +104,7 @@ pub struct Server {
     db: Mutex<Db>,
     admin_hash: [u8; 32],
     pub limits: auth::Limits,
+    pub oidc: oidc::Verifier,
     /// Bumped whenever a run changes; long polls wait on it.
     changed: watch::Sender<u64>,
     wake: Notify,
@@ -100,6 +134,11 @@ pub async fn run(cfg: Config) -> Result<(), String> {
             cfg.work.display()
         ));
     }
+    if cfg.oidc_audience.is_none() && cfg.oidc_issuers.iter().any(|i| i.kind != oidc::Kind::Azure) {
+        return Err(
+            "--oidc-issuer needs --oidc-audience: the server's public URL, which tokens must be minted for".into()
+        );
+    }
     let lock = lock_work(&cfg.work)?;
     let admin_hash = auth::load_admin_token(&cfg.admin_token_file)?;
     let version = brainproxy::check_version(&cfg.brainproxy, Some(&base_env(&cfg))).await?;
@@ -119,8 +158,10 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     }
 
     let (changed, _) = watch::channel(0);
+    let verifier = oidc::Verifier::new(cfg.oidc_issuers.clone(), cfg.oidc_audience.clone());
     let server = Arc::new(Server {
         cfg,
+        oidc: verifier,
         db: Mutex::new(db),
         admin_hash,
         limits: auth::Limits::default(),
@@ -426,6 +467,11 @@ impl Server {
         if let Err((c, e)) = self.check_host(&cli, t).await {
             return End::failed(c, e);
         }
+        if t.ownership
+            && let Err(e) = self.check_ownership(t).await
+        {
+            return End::failed(code::OUT_OF_SCOPE, format!("ownership check: {e}"));
+        }
 
         let baseline = run.baseline;
         let args = ci::Args {
@@ -441,6 +487,7 @@ impl Server {
             auth: t.profile().map(String::from),
             accept_coverage_drop: run.accept_coverage_drop,
             baseline,
+            policy: if baseline { Default::default() } else { t.policy.clone() },
         };
         let on_write = {
             let s = self.clone();
@@ -553,6 +600,7 @@ impl Server {
     pub async fn register(&self, mut t: TargetConfig) -> Result<Value, ApiError> {
         let _op = self.admin_ops.lock().await;
         t.validate(self.cfg.allow_loopback_targets).map_err(ApiError::invalid)?;
+        self.check_settings(&mut t, None)?;
         {
             let db = self.db();
             if db.target(&t.id).map_err(ApiError::db)?.is_some() {
@@ -592,6 +640,55 @@ impl Server {
             },
             "target": t.public_json(),
         }))
+    }
+
+    /// Checks what `validate` can't (the OIDC issuers this server trusts) and sets the server's own
+    /// fields: the ownership token, kept from `before` while ownership stays on.
+    fn check_settings(&self, t: &mut TargetConfig, before: Option<&TargetConfig>) -> Result<(), ApiError> {
+        oidc::check_bindings(&t.oidc, &self.cfg.oidc_issuers).map_err(ApiError::invalid)?;
+        t.ownership_token = match (t.ownership, before.and_then(|b| b.ownership_token.clone())) {
+            (false, _) => None,
+            (true, Some(kept)) => Some(kept),
+            (true, None) => Some(format!("bpo_{}", auth::base32(&auth::random_bytes::<16>()))),
+        };
+        Ok(())
+    }
+
+    /// Changes a target's OIDC bindings, alert policy or ownership check. Scope, URL and project
+    /// settings don't change: those need a new registration.
+    pub async fn update_target(&self, id: &str, patch: TargetPatch) -> Result<Value, ApiError> {
+        let _op = self.admin_ops.lock().await;
+        let before = self.db().target(id).map_err(ApiError::db)?.ok_or_else(|| ApiError::not_found("target"))?.config;
+        let mut t = before.clone();
+        if let Some(b) = patch.oidc {
+            t.oidc = b;
+        }
+        if let Some(p) = patch.policy {
+            t.policy = p;
+        }
+        if let Some(o) = patch.ownership {
+            t.ownership = o;
+        }
+        crate::policy::check(&t.policy).map_err(ApiError::invalid)?;
+        self.check_settings(&mut t, Some(&before))?;
+        self.db().update_config(&t).map_err(ApiError::db)?;
+        Ok(t.public_json())
+    }
+
+    /// Fetches `/.well-known/brainproxy-<id>.txt` from the target's origin and looks for its token.
+    async fn check_ownership(&self, t: &TargetConfig) -> Result<(), String> {
+        let Some(token) = t.ownership_token.clone() else { return Err("ownership is on but has no token".into()) };
+        let (host, port) = target::url_host_port(&t.base_url)?;
+        let scheme = if t.base_url.starts_with("https://") { "https" } else { "http" };
+        let host = if host.contains(':') { format!("[{host}]") } else { host };
+        let url = format!("{scheme}://{host}:{port}/.well-known/brainproxy-{}.txt", t.id);
+        let shown = url.clone();
+        let body = tokio::task::spawn_blocking(move || fetch_small(&url)).await.map_err(|e| e.to_string())??;
+        if body.lines().any(|l| l.trim() == token) {
+            Ok(())
+        } else {
+            Err(format!("{shown} doesn't hold this target's ownership token"))
+        }
     }
 
     /// Creates the project (or a scratch one for an upload target) in `dir` and checks the base URL

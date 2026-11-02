@@ -140,10 +140,12 @@ name = "brainproxy-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "getrandom 0.3.4",
  "http-body-util",
  "libc",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

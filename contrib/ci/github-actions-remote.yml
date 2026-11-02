@@ -6,6 +6,12 @@
 # target token (POST /v1/targets/<id>/tokens on the server's admin API) as the repository secret
 # BRAINPROXY_TOKEN.
 #
+# Or, with no stored secret: if the server runs with --oidc-issuer github and the target binds
+# this repository's id (PATCH /v1/targets/<id> {"oidc": [{"issuer":
+# "https://token.actions.githubusercontent.com", "claims": {"repository_id": "<id>"}}]}; the id is
+# in `gh api repos/OWNER/REPO --jq .id`), add `id-token: write` to the permissions, drop
+# BRAINPROXY_TOKEN and pass `--oidc github` to remote run.
+#
 # Exit codes of `remote run`:
 #   0 passed
 #   5 the gate failed (new findings at or above the target's fail_on risk)
@@ -26,6 +32,7 @@ on:
 permissions:
   contents: read
   security-events: write      # for the SARIF upload
+  # id-token: write           # only with --oidc github
 
 env:
   SCAN_SERVER: https://scan.corp.test

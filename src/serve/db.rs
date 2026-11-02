@@ -285,6 +285,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn update_config(&self, config: &TargetConfig) -> Result<()> {
+        let text = serde_json::to_string(config).unwrap_or_default();
+        self.conn.execute("UPDATE targets SET config = ?2 WHERE id = ?1", params![config.id, text])?;
+        Ok(())
+    }
+
     pub fn set_project_ready(&self, id: &str) -> Result<()> {
         self.conn.execute("UPDATE targets SET project_ready = 1 WHERE id = ?1", [id])?;
         Ok(())

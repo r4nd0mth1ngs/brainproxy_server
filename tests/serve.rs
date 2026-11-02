@@ -123,7 +123,11 @@ impl Server {
                 r.call()
             }
             m => {
-                let mut r = if m == "PUT" { self.agent.put(&url) } else { self.agent.post(&url) };
+                let mut r = match m {
+                    "PUT" => self.agent.put(&url),
+                    "PATCH" => self.agent.patch(&url),
+                    _ => self.agent.post(&url),
+                };
                 if let Some(a) = &auth {
                     r = r.header("Authorization", a);
                 }
@@ -827,4 +831,160 @@ fn trigger_rate_limit() {
     }
     let (status, v) = s.trigger("rl", &tok, json!({"commit": "c10"}));
     assert_eq!(status, 429, "{v}");
+}
+
+// -- phase 3: OIDC, alert policies, ownership ---------------------------------------------------
+
+/// An ES256 key, its JWKS, and a signer.
+struct Issuer {
+    pair: ring::signature::EcdsaKeyPair,
+}
+
+impl Issuer {
+    fn new() -> Issuer {
+        use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        Issuer { pair: EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap() }
+    }
+
+    fn jwks(&self) -> String {
+        use base64::Engine;
+        use ring::signature::KeyPair;
+        let b = |x: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x);
+        let point = self.pair.public_key().as_ref();
+        json!({"keys": [{"kty": "EC", "crv": "P-256", "kid": "k1", "use": "sig", "alg": "ES256",
+                         "x": b(&point[1..33]), "y": b(&point[33..65])}]})
+        .to_string()
+    }
+
+    fn sign(&self, claims: Value) -> String {
+        use base64::Engine;
+        let b = |x: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(x);
+        let h = b(json!({"alg": "ES256", "kid": "k1", "typ": "JWT"}).to_string().as_bytes());
+        let p = b(claims.to_string().as_bytes());
+        let sig = self.pair.sign(&ring::rand::SystemRandom::new(), format!("{h}.{p}").as_bytes()).unwrap();
+        format!("{h}.{p}.{}", b(sig.as_ref()))
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+}
+
+#[test]
+fn oidc_tokens_trigger_and_read_only_the_targets_that_bind_them() {
+    let Some(cli) = cli() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let idp = App::start(0);
+    let key = Issuer::new();
+    idp.state.files.lock().unwrap().insert("/oauth/discovery/keys".into(), key.jwks());
+    let iss = format!("http://{}", idp.host());
+    let s = Server::start(
+        dir.path(),
+        &cli,
+        &["--oidc-issuer", &format!("gitlab={iss}"), "--oidc-audience", "https://scan.corp.test"],
+    );
+    let app = App::start(1);
+
+    // Bindings must name the immutable project id, and an issuer the server trusts.
+    for bad in [
+        json!([{"issuer": iss, "claims": {"ref": "main"}}]),
+        json!([{"issuer": "https://gitlab.elsewhere.test", "claims": {"project_id": "5"}}]),
+    ] {
+        let body = json!({"id": "bad", "base_url": app.url(), "scope": [app.host()], "oidc": bad});
+        let (status, v) = s.admin("POST", "/v1/targets", Some(body));
+        assert_eq!(status, 400, "{v}");
+    }
+    s.register("shop", &app, json!({"oidc": [{"issuer": iss, "claims": {"project_id": "5", "ref": "main"}}]}));
+    s.register("other", &app, json!({}));
+
+    let claims = |project: &str, aud: &str, exp: i64| {
+        json!({"iss": iss, "aud": aud, "exp": unix_now() + exp, "iat": unix_now(),
+               "sub": "project_path:acme/shop:ref_type:branch:ref:main", "project_path": "acme/shop",
+               "project_id": project, "ref": "main", "pipeline_id": "77"})
+    };
+    let jwt = key.sign(claims("5", "https://scan.corp.test", 300));
+    assert_eq!(s.get_public("/v1/targets/shop/runs", Some(&jwt)).0, 200);
+    assert_eq!(s.get_public("/v1/targets/other/runs", Some(&jwt)).0, 401, "a target that doesn't bind it");
+    assert_eq!(s.get_public("/v1/targets", Some(&jwt)).0, 401, "no target in the path");
+    let other_project = key.sign(claims("6", "https://scan.corp.test", 300));
+    assert_eq!(s.get_public("/v1/targets/shop/runs", Some(&other_project)).0, 401);
+    let other_aud = key.sign(claims("5", "https://elsewhere.test", 300));
+    assert_eq!(s.get_public("/v1/targets/shop/runs", Some(&other_aud)).0, 401);
+    let expired = key.sign(claims("5", "https://scan.corp.test", -600));
+    assert_eq!(s.get_public("/v1/targets/shop/runs", Some(&expired)).0, 401);
+    let forged = Issuer::new().sign(claims("5", "https://scan.corp.test", 300));
+    assert_eq!(s.get_public("/v1/targets/shop/runs", Some(&forged)).0, 401, "another key");
+    // OIDC tokens mean nothing on the admin listener.
+    assert_eq!(s.request("GET", s.admin, "/v1/targets", Some(&jwt), None).0, 401);
+
+    // A pipeline holding the token (GitLab's id_tokens, named with --token-env) runs a scan.
+    let (code, r) = remote(&s, &jwt, &["run", "--target", "shop", "--commit", "c1"]);
+    assert_eq!(code, 0, "{r}\n{}", s.log());
+    let (_, audit) = s.admin("GET", "/v1/audit?limit=100", None);
+    let trigger = audit["data"]["audit"].as_array().unwrap().iter().find(|e| e["action"] == "trigger").unwrap();
+    assert_eq!(trigger["actor_kind"], "oidc", "{trigger}");
+    assert!(trigger["actor"].as_str().unwrap().contains("project_id=5"), "{trigger}");
+
+    // Unbinding takes effect at once.
+    let (status, v) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"oidc": []})));
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(s.get_public("/v1/targets/shop/runs", Some(&jwt)).0, 401);
+    // Scope can't change this way.
+    let (status, _) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"scope": ["elsewhere.test"]})));
+    assert_eq!(status, 400);
+}
+
+#[test]
+fn alert_policies_and_the_ownership_check() {
+    let Some((_dir, s)) = setup(&[]) else { return };
+    let app = App::start(2);
+    app.state.drift.store(true, Ordering::SeqCst);
+    s.register("shop", &app, json!({"gate": {"fail_on": "high"}}));
+    let tok = s.token("shop", "trigger");
+
+    // Without a policy the high findings fail the gate.
+    let (code, r1) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c1"]);
+    assert_eq!(code, 5, "{r1}");
+    let run = r1["run"].as_str().unwrap();
+    let (_, cmp) = s.get_public(&format!("/v1/targets/shop/runs/{run}/compare.json"), Some(&tok));
+    let findings: Vec<Value> =
+        ["new", "unchanged"].iter().flat_map(|k| cmp["data"][k].as_array().cloned().unwrap_or_default()).collect();
+    let id = |f: &Value| f["alert_ref"].as_str().unwrap().split('-').next().unwrap().to_string();
+    let high: Vec<String> = findings.iter().filter(|f| f["risk"] == "high").map(id).collect();
+    let low = findings.iter().find(|f| f["risk"] != "high").map(id).expect("a finding below high");
+    assert!(!high.is_empty(), "{cmp}");
+
+    // Ignoring the high rules lets it pass; the reasons say what the policy did.
+    let ignore: serde_json::Map<String, Value> = high.iter().map(|r| (r.clone(), json!("ignore"))).collect();
+    let (status, v) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"policy": ignore})));
+    assert_eq!(status, 200, "{v}");
+    let (code, r2) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c2"]);
+    assert_eq!(code, 0, "{r2}");
+    assert!(r2["reasons"].as_array().unwrap().iter().any(|r| r.as_str().unwrap().starts_with("policy:")), "{r2}");
+
+    // A fail rule fails the gate below the risk threshold.
+    let mut policy = ignore.clone();
+    policy.insert(low.clone(), json!("fail"));
+    assert_eq!(s.admin("PATCH", "/v1/targets/shop", Some(json!({"policy": policy}))).0, 200);
+    let (code, r3) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c3"]);
+    assert_eq!(code, 5, "{r3}");
+    let bad = s.admin("PATCH", "/v1/targets/shop", Some(json!({"policy": {"x10020": "ignore"}})));
+    assert_eq!(bad.0, 400, "{}", bad.1);
+
+    // Ownership: the target must serve the token before a scan starts.
+    let (status, v) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"ownership": true, "policy": {}})));
+    assert_eq!(status, 200, "{v}");
+    let owner_token = v["data"]["ownership_token"].as_str().unwrap().to_string();
+    assert!(owner_token.starts_with("bpo_"));
+    let (code, r4) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c4"]);
+    assert_eq!(code, 6, "{r4}");
+    assert!(r4["reasons"].to_string().contains("ownership check"), "{r4}");
+    app.state.files.lock().unwrap().insert("/.well-known/brainproxy-shop.txt".into(), format!("{owner_token}\n"));
+    let (code, r5) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c5"]);
+    assert_eq!(code, 5, "the scan ran and gated again: {r5}");
+    // The token stays the same while ownership stays on.
+    let (_, v) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"ownership": true})));
+    assert_eq!(v["data"]["ownership_token"], owner_token.as_str());
 }

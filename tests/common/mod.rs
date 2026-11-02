@@ -34,6 +34,8 @@ pub struct State {
     pub drift: AtomicBool,
     pub pages: AtomicU64,
     pub delay_ms: AtomicU64,
+    /// Extra files by path (a JWKS, an ownership file).
+    pub files: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 pub struct App {
@@ -118,6 +120,9 @@ fn route(target: &str, body: &str, cookie: &str, state: &State) -> (&'static str
         query.split('&').find_map(|kv| kv.strip_prefix(&format!("{name}="))).map(decode).unwrap_or_default()
     };
     let html = |inner: String| format!("<html><head><title>app</title></head><body>{inner}</body></html>");
+    if let Some(f) = state.files.lock().unwrap().get(path) {
+        return ("200 OK", String::new(), f.clone());
+    }
     match path {
         "/" => {
             let mut links = String::from("<a href=\"/search?q=hello\">search</a>");

@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::brainproxy::{self, Cli, Output, code};
+use crate::policy::{self, Policy};
 use crate::record::{self, Coverage, CoverageBaseline, Gate, Job, JobRef, Outcome, Run, Summary};
 use crate::time;
 
@@ -41,6 +42,8 @@ pub struct Args {
     pub auth: Option<String>,
     pub accept_coverage_drop: bool,
     pub baseline: bool,
+    /// Alert policy for the gate; empty: the CLI's `--fail-on` alone decides.
+    pub policy: Policy,
 }
 
 pub type OnWrite = Arc<dyn Fn(&Run) + Send + Sync>;
@@ -172,6 +175,7 @@ impl Ci {
             auth: args.auth.clone(),
             max_minutes: args.max_minutes,
             rate: args.rate,
+            policy: if args.baseline { None } else { policy::fingerprint(&args.policy) },
             started_at: time::now(),
             finished_at: None,
             job: None,
@@ -408,7 +412,13 @@ impl Ci {
             argv.extend(["--since-scan".into(), p.job.to_string()]);
         }
         argv.extend(["--limit".into(), NO_LIMIT.into()]);
-        if complete && let Some(risk) = &self.args.fail_on {
+        // With an alert policy the gate is worked out here from the compare output, so the CLI
+        // doesn't gate.
+        let local_gate = complete && !self.args.baseline && !self.args.policy.is_empty();
+        if complete
+            && !local_gate
+            && let Some(risk) = &self.args.fail_on
+        {
             argv.extend(["--fail-on".into(), risk.clone()]);
             if self.args.new_only {
                 argv.push("--new-only".into());
@@ -428,12 +438,31 @@ impl Ci {
                         unchanged: s["unchanged"].as_u64().unwrap_or(0),
                         fixed: s["fixed"].as_u64().unwrap_or(0),
                     });
-                    if d["gate"].is_object() {
+                    if local_gate {
+                        if s["truncated"] == true {
+                            self.run
+                                .reasons
+                                .push("compare: the finding lists were cut off; the policy gate is incomplete".into());
+                        }
+                        let gate = policy::gate(d, self.args.fail_on.as_deref(), self.args.new_only, &self.args.policy);
+                        if let Some(p) = &gate.policy {
+                            if p.ignored + p.warned > 0 {
+                                self.run
+                                    .reasons
+                                    .push(format!("policy: {} finding(s) ignored, {} warned", p.ignored, p.warned));
+                            }
+                            for w in &p.warnings {
+                                self.run.reasons.push(format!("policy warning: {w}"));
+                            }
+                        }
+                        self.run.gate = Some(gate);
+                    } else if d["gate"].is_object() {
                         self.run.gate = Some(Gate {
                             fail_on: d["gate"]["fail_on"].as_str().unwrap_or_default().to_string(),
                             new_only: d["gate"]["new_only"].as_bool().unwrap_or(false),
                             passed: d["gate"]["passed"].as_bool().unwrap_or(false),
                             count: d["gate"]["count"].as_u64().unwrap_or(0),
+                            policy: None,
                         });
                     }
                     for w in d["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str) {
@@ -441,18 +470,28 @@ impl Ci {
                     }
                 }
                 // Exit 0 only counts with a complete envelope and, when gating, a gate that passed.
-                let gated = complete && self.args.fail_on.is_some();
+                let gated = complete && (self.args.fail_on.is_some() || local_gate);
                 let gate_passed = self.run.gate.as_ref().is_some_and(|g| g.passed);
-                match cmp.code {
+                // The policy gate turns the CLI's pass into a gate failure here.
+                let code = if local_gate && cmp.code == code::OK && cmp.json["ok"] == true && !gate_passed {
+                    code::GATE_FAILED
+                } else {
+                    cmp.code
+                };
+                match code {
                     code::OK if cmp.json["ok"] == true && (!gated || gate_passed) => {}
                     code::GATE_FAILED if complete && cmp.json["ok"] == true => {
                         outcome = Outcome::Failed;
                         exit = code::GATE_FAILED;
                         let count = self.run.gate.as_ref().map_or(0, |g| g.count);
+                        let threshold = match (&self.args.fail_on, local_gate) {
+                            (Some(r), false) => format!("at or above {r}"),
+                            (Some(r), true) => format!("at or above {r} or failed by the alert policy"),
+                            (None, _) => "failed by the alert policy".into(),
+                        };
                         self.run.reasons.push(format!(
-                            "the gate failed: {count} {}finding(s) at or above {}",
+                            "the gate failed: {count} {}finding(s) {threshold}",
                             if self.args.new_only { "new " } else { "" },
-                            self.args.fail_on.as_deref().unwrap_or("?")
                         ));
                     }
                     c => {

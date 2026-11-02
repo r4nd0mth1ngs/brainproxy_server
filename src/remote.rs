@@ -1,6 +1,7 @@
 //! `brainproxy-server remote run|wait`: what a pipeline runs to trigger a scan on a server, wait for
 //! it, and exit with the CLI's codes (research §4.6). No brainproxy CLI is involved.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,10 @@ pub struct Args {
     pub server: String,
     pub target: String,
     pub token_env: String,
+    /// `github`: get a short-lived OIDC token from GitHub Actions instead of reading a token.
+    pub oidc: Option<String>,
+    /// The audience to ask for; default the server's URL.
+    pub audience: Option<String>,
     /// `wait` only: the run to wait for.
     pub run: Option<String>,
     pub commit: Option<String>,
@@ -35,10 +40,24 @@ pub struct Args {
     pub drift: Option<PathBuf>,
 }
 
+/// GitHub's ID tokens live minutes; one older than this is fetched again.
+const OIDC_REFRESH: Duration = Duration::from_secs(4 * 60);
+
+enum Credential {
+    Static(String),
+    /// GitHub Actions' ID token endpoint, its bearer, the audience, and the last token.
+    Github {
+        url: String,
+        bearer: String,
+        audience: String,
+        last: RefCell<Option<(String, Instant)>>,
+    },
+}
+
 struct Client {
     agent: ureq::Agent,
     base: String,
-    token: String,
+    credential: Credential,
 }
 
 /// An HTTP answer: status and envelope.
@@ -55,12 +74,39 @@ impl Answer {
 
 impl Client {
     fn new(args: &Args) -> Result<Client, (i32, String)> {
-        let token = std::env::var(&args.token_env)
-            .ok()
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .ok_or((code::USAGE, format!("no token: set the environment variable {}", args.token_env)))?;
         let base = args.server.trim_end_matches('/').to_string();
+        let credential = match args.oidc.as_deref() {
+            None => Credential::Static(
+                std::env::var(&args.token_env)
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .ok_or((code::USAGE, format!("no token: set the environment variable {}", args.token_env)))?,
+            ),
+            Some("github") => {
+                let var = |name: &str| {
+                    std::env::var(name).ok().filter(|v| !v.is_empty()).ok_or((
+                        code::USAGE,
+                        format!("--oidc github: {name} isn't set; give the job `permissions: id-token: write`"),
+                    ))
+                };
+                Credential::Github {
+                    url: var("ACTIONS_ID_TOKEN_REQUEST_URL")?,
+                    bearer: var("ACTIONS_ID_TOKEN_REQUEST_TOKEN")?,
+                    audience: args.audience.clone().unwrap_or_else(|| base.clone()),
+                    last: RefCell::new(None),
+                }
+            }
+            Some(other) => {
+                return Err((
+                    code::USAGE,
+                    format!(
+                        "--oidc {other}: only github fetches its own token; on GitLab or Azure DevOps put the \
+                         ID token in a variable and name it with --token-env"
+                    ),
+                ));
+            }
+        };
         if !(base.starts_with("https://") || base.starts_with("http://")) {
             return Err((code::USAGE, "--server must be an http(s) URL".into()));
         }
@@ -75,7 +121,34 @@ impl Client {
             .user_agent(concat!("brainproxy-server-remote/", env!("CARGO_PKG_VERSION")))
             .build()
             .into();
-        Ok(Client { agent, base, token })
+        Ok(Client { agent, base, credential })
+    }
+
+    /// The bearer token to send: the static one, or a fresh GitHub ID token.
+    fn token(&self) -> Result<String, String> {
+        let (url, bearer, audience, last) = match &self.credential {
+            Credential::Static(t) => return Ok(t.clone()),
+            Credential::Github { url, bearer, audience, last } => (url, bearer, audience, last),
+        };
+        if let Some((t, at)) = last.borrow().as_ref()
+            && at.elapsed() < OIDC_REFRESH
+        {
+            return Ok(t.clone());
+        }
+        let sep = if url.contains('?') { '&' } else { '?' };
+        let mut resp = self
+            .agent
+            .get(&format!("{url}{sep}audience={}", percent_encode(audience)))
+            .header("Authorization", &format!("Bearer {bearer}"))
+            .call()
+            .map_err(|e| format!("GitHub ID token: {e}"))?;
+        if resp.status().as_u16() != 200 {
+            return Err(format!("GitHub ID token: HTTP {}", resp.status()));
+        }
+        let v: Value = resp.body_mut().read_json().map_err(|e| format!("GitHub ID token: {e}"))?;
+        let t = v["value"].as_str().filter(|t| !t.is_empty()).ok_or("GitHub ID token: no value")?.to_string();
+        *last.borrow_mut() = Some((t.clone(), Instant::now()));
+        Ok(t)
     }
 
     fn target_path(&self, target: &str, rest: &str) -> String {
@@ -84,7 +157,7 @@ impl Client {
 
     /// One request; `Err` only for a transport failure (no HTTP answer).
     fn send(&self, method: &str, url: &str, body: Option<&Value>, key: Option<&str>) -> Result<Answer, String> {
-        let auth = format!("Bearer {}", self.token);
+        let auth = format!("Bearer {}", self.token()?);
         let resp = match method {
             "POST" => {
                 let mut req = self.agent.post(url).header("Authorization", &auth);
@@ -131,7 +204,7 @@ impl Client {
         let mut resp = self
             .agent
             .get(url)
-            .header("Authorization", &format!("Bearer {}", self.token))
+            .header("Authorization", &format!("Bearer {}", self.token()?))
             .call()
             .map_err(|e| e.to_string())?;
         if resp.status().as_u16() != 200 {
@@ -335,6 +408,16 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
+/// Percent-encodes everything but RFC 3986's unreserved characters.
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +430,11 @@ mod tests {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(1800));
         assert!(parse_duration("1d").is_err());
         assert!(parse_duration("m").is_err());
+    }
+
+    #[test]
+    fn percent_encoding() {
+        assert_eq!(percent_encode("https://scan.corp.test/a b"), "https%3A%2F%2Fscan.corp.test%2Fa%20b");
     }
 
     #[test]

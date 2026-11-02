@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use super::auth::{self, Bucket};
 use super::db::{self, AuditEntry, Perm, RunRow, Token, state};
 use super::target::{self, TargetConfig};
-use super::{DEDUP_MS, Server};
+use super::{DEDUP_MS, Server, TargetPatch, oidc};
 use crate::time;
 
 /// Request bodies other than a project upload.
@@ -115,7 +115,7 @@ pub fn admin_router(server: Arc<Server>) -> Router {
     let max_upload = (server.cfg.max_project_mb as usize).saturating_mul(1024 * 1024);
     common(Router::new())
         .route("/v1/targets", post(register))
-        .route("/v1/targets/{t}", axum::routing::delete(remove_target))
+        .route("/v1/targets/{t}", axum::routing::delete(remove_target).patch(update_target))
         .route("/v1/targets/{t}/tokens", post(issue_token).get(list_tokens))
         .route("/v1/targets/{t}/tokens/{id}", axum::routing::delete(revoke_token))
         .route("/v1/targets/{t}/project", axum::routing::put(upload).layer(DefaultBodyLimit::max(max_upload)))
@@ -147,6 +147,8 @@ fn common(r: Router<App>) -> Router<App> {
 enum Caller {
     Admin,
     Token(Token),
+    /// A CI identity a target binds (OIDC).
+    Oidc(oidc::Identity),
 }
 
 impl Caller {
@@ -154,6 +156,7 @@ impl Caller {
         let (actor, kind) = match self {
             Caller::Admin => ("admin".to_string(), "admin"),
             Caller::Token(t) => (format!("{} ({})", t.name, t.id), "token"),
+            Caller::Oidc(i) => (i.actor.clone(), "oidc"),
         };
         AuditEntry {
             actor,
@@ -170,6 +173,7 @@ impl Caller {
         match self {
             Caller::Admin => "admin".into(),
             Caller::Token(t) => t.id.clone(),
+            Caller::Oidc(i) => i.owner.clone(),
         }
     }
 }
@@ -192,8 +196,59 @@ fn client_ip(app: &App, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
 }
 
 /// Checks the bearer token for `target` (or no target) and `need`. On the admin listener only the
-/// admin token counts; on the public one only target tokens.
-fn authenticate(
+/// admin token counts; on the public one target tokens, and OIDC tokens a target binds.
+async fn authenticate(
+    app: &App,
+    ip: IpAddr,
+    headers: &HeaderMap,
+    target: Option<&str>,
+    need: Perm,
+) -> Result<Caller, ApiError> {
+    let s = &app.server;
+    let presented = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(auth::bearer);
+    let Some(jwt) = presented.filter(|t| !app.admin && s.oidc.enabled() && oidc::looks_like_jwt(t)) else {
+        return authenticate_token(app, ip, headers, target, need);
+    };
+    let Some(target) = target else {
+        return Err(refuse_auth(app, ip, None, None, "an OIDC token on an endpoint without a target"));
+    };
+    // Bound first: the guard must not live across the await.
+    let found = s.db().target(target).map_err(ApiError::db)?;
+    let bindings = found.map(|t| t.config.oidc).unwrap_or_default();
+    let now = time::now_millis() / 1000;
+    let identity = match s.oidc.verify(jwt, &bindings, now).await {
+        Ok(i) => i,
+        Err(oidc::Refused(why)) => return Err(refuse_auth(app, ip, None, Some(target), &format!("OIDC: {why}"))),
+    };
+    if !s.limits.take(Bucket::Read, &identity.owner) {
+        return Err(ApiError::too_many("too many requests for this identity; try again later"));
+    }
+    Ok(Caller::Oidc(identity))
+}
+
+/// Counts and audits a failed authentication; the error to answer with.
+fn refuse_auth(app: &App, ip: IpAddr, presented: Option<&str>, target: Option<&str>, why: &str) -> ApiError {
+    let s = &app.server;
+    let key = format!("{}:{ip}", if app.admin { "admin" } else { "public" });
+    if !s.limits.take(Bucket::AuthFailure, &key) {
+        return ApiError::too_many("too many failed authentications from this address; try again later");
+    }
+    let named = presented.and_then(auth::token_target).filter(|t| target::valid_id(t));
+    s.audit(AuditEntry {
+        actor: named.map_or("unknown".into(), |t| format!("a token for {t}")),
+        actor_kind: "none".into(),
+        ip: Some(ip.to_string()),
+        action: "authenticate".into(),
+        target: target.filter(|t| target::valid_id(t)).map(String::from),
+        result: "refused".into(),
+        detail: Some(why.into()),
+        ..AuditEntry::default()
+    });
+    ApiError::unauthorized()
+}
+
+/// The admin token or a target token.
+fn authenticate_token(
     app: &App,
     ip: IpAddr,
     headers: &HeaderMap,
@@ -205,25 +260,8 @@ fn authenticate(
     // so nobody can lock pipelines or the admin out by failing on purpose from a shared address
     // (a reverse proxy on this machine, a CI NAT); tokens are 256-bit, so the limit only bounds
     // noise and audit writes.
-    let key = format!("{}:{ip}", if app.admin { "admin" } else { "public" });
     let presented = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(auth::bearer);
-    let fail = |why: &str| {
-        if !s.limits.take(Bucket::AuthFailure, &key) {
-            return ApiError::too_many("too many failed authentications from this address; try again later");
-        }
-        let named = presented.and_then(auth::token_target).filter(|t| target::valid_id(t));
-        s.audit(AuditEntry {
-            actor: named.map_or("unknown".into(), |t| format!("a token for {t}")),
-            actor_kind: "none".into(),
-            ip: Some(ip.to_string()),
-            action: "authenticate".into(),
-            target: target.filter(|t| target::valid_id(t)).map(String::from),
-            result: "refused".into(),
-            detail: Some(why.into()),
-            ..AuditEntry::default()
-        });
-        ApiError::unauthorized()
-    };
+    let fail = |why: &str| refuse_auth(app, ip, presented, target, why);
     let Some(token) = presented else { return Err(fail("no bearer token")) };
     if app.admin {
         return if s.is_admin(token) { Ok(Caller::Admin) } else { Err(fail("not the admin token")) };
@@ -290,12 +328,13 @@ async fn list_targets(
     headers: HeaderMap,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    let caller = authenticate(&app, ip, &headers, None, Perm::Read)?;
+    let caller = authenticate(&app, ip, &headers, None, Perm::Read).await?;
     let targets = app.server.db().targets().map_err(ApiError::db)?;
     let mut out = Vec::new();
     for t in targets.iter().filter(|t| match &caller {
         Caller::Admin => true,
         Caller::Token(tok) => tok.target == t.config.id,
+        Caller::Oidc(_) => false,
     }) {
         out.push(target_json(&app, t)?);
     }
@@ -309,7 +348,7 @@ async fn show_target(
     Path(t): Path<String>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
+    authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     let target = load_target(&app, &t)?;
     ok(StatusCode::OK, target_json(&app, &target)?)
 }
@@ -376,7 +415,7 @@ async fn list_runs(
     Query(q): Query<ListQuery>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
+    authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     load_target(&app, &t)?;
     let rows = app.server.db().runs(&t, q.limit.unwrap_or(20).clamp(1, 200)).map_err(ApiError::db)?;
     let runs = rows.iter().map(|r| run_json(&app, r)).collect::<Result<Vec<_>, _>>()?;
@@ -396,7 +435,7 @@ async fn show_run(
     Query(q): Query<WaitQuery>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
+    authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     let find = || app.server.db().run(&t, &r).map_err(ApiError::db)?.ok_or_else(|| ApiError::not_found("run"));
     let mut row = find()?;
     let wait = q.wait.unwrap_or(0).min(MAX_WAIT_SECS);
@@ -426,7 +465,7 @@ async fn latest(
     Path(t): Path<String>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
+    authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     load_target(&app, &t)?;
     let row = app.server.db().last_run_in_state(&t, state::COMPLETED).map_err(ApiError::db)?;
     let row = row.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no completed run yet"))?;
@@ -440,7 +479,7 @@ async fn drift(
     Path((t, r)): Path<(String, String)>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
+    authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     let row = app.server.db().run(&t, &r).map_err(ApiError::db)?.ok_or_else(|| ApiError::not_found("run"))?;
     let path = app.server.run_dir(&t, &row.id).join("compare.json");
     let text = tokio::fs::read_to_string(&path)
@@ -457,7 +496,7 @@ async fn download(
     Path((t, r, file)): Path<(String, String, String)>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Read)?;
+    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     let content_type = match file.as_str() {
         "report.json" | "compare.json" => "application/json",
         "report.html" => "text/html; charset=utf-8",
@@ -518,11 +557,9 @@ async fn trigger(
     body: Bytes,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Trigger)?;
-    if let Caller::Token(tok) = &caller
-        && !app.server.limits.take(Bucket::Trigger, &tok.id)
-    {
-        return Err(ApiError::too_many("this token triggered 10 runs in the last hour; try again later"));
+    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Trigger).await?;
+    if !matches!(caller, Caller::Admin) && !app.server.limits.take(Bucket::Trigger, &caller.key_owner()) {
+        return Err(ApiError::too_many("this caller triggered 10 runs in the last hour; try again later"));
     }
     let target = load_target(&app, &t)?;
     let b: TriggerBody = parse_body(&body)?;
@@ -641,7 +678,7 @@ async fn cancel(
     Path((t, r)): Path<(String, String)>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Trigger)?;
+    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Trigger).await?;
     let before = app.server.cancel(&t, &r)?.ok_or_else(|| ApiError::not_found("run"))?;
     let mut e = caller.audit(ip, "cancel");
     e.target = Some(t.clone());
@@ -659,7 +696,7 @@ fn admin_only(app: &App, peer: SocketAddr, headers: &HeaderMap) -> Result<(IpAdd
     if !app.admin {
         return Err(ApiError::not_found("endpoint"));
     }
-    Ok((ip, authenticate(app, ip, headers, None, Perm::Trigger)?))
+    Ok((ip, authenticate_token(app, ip, headers, None, Perm::Trigger)?))
 }
 
 async fn register(
@@ -681,6 +718,33 @@ async fn register(
     }
     app.server.audit(e);
     ok(StatusCode::CREATED, result?)
+}
+
+async fn update_target(
+    State(app): State<App>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(t): Path<String>,
+    body: Bytes,
+) -> ApiResult {
+    let (ip, caller) = admin_only(&app, peer, &headers)?;
+    let patch: TargetPatch =
+        serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("request body: {e}")))?;
+    let changed: Vec<&str> =
+        [("oidc", patch.oidc.is_some()), ("policy", patch.policy.is_some()), ("ownership", patch.ownership.is_some())]
+            .into_iter()
+            .filter_map(|(k, set)| set.then_some(k))
+            .collect();
+    let result = app.server.update_target(&t, patch).await;
+    let mut e = caller.audit(ip, "update");
+    e.target = Some(t);
+    e.detail = Some(format!("changed {}", changed.join(", ")));
+    if let Err(err) = &result {
+        e.result = "refused".into();
+        e.detail = Some(err.message.clone());
+    }
+    app.server.audit(e);
+    ok(StatusCode::OK, result?)
 }
 
 async fn remove_target(

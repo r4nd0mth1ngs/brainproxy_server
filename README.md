@@ -5,8 +5,8 @@ Pipelines call it after deploying to a dev instance: it scans a registered targe
 results with the previous scan, and reports what is new, fixed and unchanged. One server handles
 at most 10 targets.
 
-Status: early development. `ci`, `serve` and `remote` work; OIDC from CI, alert policies and a
-results page come next.
+Status: early development. `ci`, `serve` and `remote` work, with OIDC from CI, alert policies, an
+optional ownership check and a read-only results page.
 
 ## `brainproxy-server ci`
 
@@ -143,17 +143,44 @@ refused unless its scope is inside the registered one, it has no upstream proxie
 `connection upstream`), its host overrides (`connection hosts`) point only at addresses the scope
 lists, and no profile stores a password in the file.
 
+### OIDC, alert policies, ownership
+
+- **OIDC from CI** replaces stored tokens. The server trusts the issuers it is started with
+  (`--oidc-issuer github`, `--oidc-issuer gitlab=https://gitlab.example.test`,
+  `--oidc-issuer azure=ISSUER,JWKS_URL`) and `--oidc-audience https://scan.example.test`, the
+  audience tokens must be minted for. A target binds claims, which must all match exactly:
+  `"oidc": [{"issuer": "https://token.actions.githubusercontent.com", "claims": {"repository_id":
+  "123456", "ref": "refs/heads/main"}}]`. A GitHub binding must name `repository_id`, a GitLab one
+  `project_id` (ids a recreated repository with the same name doesn't inherit), an Azure DevOps one
+  `sub` (the service connection; its audience is fixed, so any receiver of that connection's tokens
+  accepts them). RS256 and ES256 only; keys are cached for 10 minutes. A bound token may trigger,
+  read and cancel on that target, like a trigger token; `remote --oidc github` fetches GitHub's
+  token itself, and GitLab's `id_tokens` go in through `--token-env`.
+- **Alert policy**: `"policy": {"10020": "ignore", "10038-1": "warn", "40012": "fail"}`, per rule
+  id or variant, like ZAP's baseline rules file (`ci --policy FILE` takes that file's
+  tab-separated format, or JSON). `ignore` leaves the rule out of the gate, `warn` lists it in the
+  reasons without failing, `fail` fails the gate whatever the risk. Reports still list every
+  finding. Changing the policy restarts the "new since the last pass" history.
+- **Ownership check** (`"ownership": true`, off by default): before each scan the target must
+  serve the token the server made (`ownership_token` in the target's configuration) as a line of
+  `/.well-known/brainproxy-<id>.txt`, or the run fails with exit 6. It guards against registering
+  the wrong host; like GitLab's site validation it is not a security feature.
+
+`PATCH /v1/targets/{t}` (admin) changes `oidc`, `policy` and `ownership`; the scope and URL only
+change with a new registration.
+
 ### Endpoints
 
 | Method and path | Who | |
 |---|---|---|
 | `POST /v1/targets`, `DELETE /v1/targets/{t}` | admin | Register or remove a target (at most 10) |
+| `PATCH /v1/targets/{t}` | admin | Change `oidc`, `policy`, `ownership` |
 | `POST/GET /v1/targets/{t}/tokens`, `DELETE .../tokens/{id}` | admin | Issue, list, revoke tokens |
 | `PUT /v1/targets/{t}/project` | admin | Upload a project |
 | `POST /v1/targets/{t}/next-run` | admin | `{"baseline": true}` or `{"accept_coverage_drop": true}` for the next run only |
 | `GET /v1/summary`, `GET /v1/audit` | admin | Counts and last runs per target; the audit log |
 | `GET /v1/targets`, `GET /v1/targets/{t}` | token (own target) or admin | Configuration, without secret sources |
-| `POST /v1/targets/{t}/runs` | trigger token | `{"commit", "ref", "pipeline_url", "preset"}`, all optional |
+| `POST /v1/targets/{t}/runs` | trigger token or bound OIDC token | `{"commit", "ref", "pipeline_url", "preset"}`, all optional |
 | `GET /v1/targets/{t}/runs`, `.../runs/{r}?wait=60` | token | List runs; a run's status, long-polled |
 | `POST /v1/targets/{t}/runs/{r}/cancel` | trigger token | Cancel (stops the scan) |
 | `GET .../runs/{r}/drift` | token | New, unchanged and fixed findings and the gate (`findings compare`) |

@@ -9,6 +9,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::oidc;
+use crate::policy::{self, Policy};
+
 /// `[a-z0-9-]{1,32}`, not starting or ending with `-`: used in paths, file names and tokens.
 pub fn valid_id(id: &str) -> bool {
     (1..=32).contains(&id.len())
@@ -149,6 +152,20 @@ pub struct TargetConfig {
     /// the file `<secrets dir>/<target>/<CLI variable>`, else the server's environment variable.
     #[serde(default)]
     pub secret_env: BTreeMap<String, String>,
+    /// CI identities (OIDC) that may trigger and read this target, besides its tokens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub oidc: Vec<oidc::Binding>,
+    /// What the gate does with each rule (see `policy`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub policy: Policy,
+    /// Before each run the target must serve `ownership_token` at
+    /// `/.well-known/brainproxy-<id>.txt` (research §5.2: a guard against typos, not a security
+    /// feature).
+    #[serde(default)]
+    pub ownership: bool,
+    /// Made by the server when `ownership` is turned on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_token: Option<String>,
 }
 
 fn default_preset() -> String {
@@ -251,6 +268,7 @@ impl TargetConfig {
                 return Err(format!("auth.password_env {var} has no entry in secret_env"));
             }
         }
+        policy::check(&self.policy)?;
         for (cli_var, source) in &self.secret_env {
             if !valid_secret_var(cli_var) || !valid_secret_var(source) {
                 return Err(format!(

@@ -7,6 +7,7 @@
 
 mod brainproxy;
 mod ci;
+mod policy;
 mod record;
 mod remote;
 mod serve;
@@ -85,6 +86,13 @@ struct ServeOpts {
     /// Take the client address from X-Forwarded-For (only behind a reverse proxy that sets it).
     #[arg(long)]
     trust_forwarded: bool,
+    /// Trust CI tokens from this OIDC issuer, which targets can then bind (repeatable):
+    /// `github`, `gitlab=https://gitlab.example[,JWKS_URL]` or `azure=ISSUER,JWKS_URL`.
+    #[arg(long, value_name = "KIND=ISSUER[,JWKS]")]
+    oidc_issuer: Vec<String>,
+    /// The audience OIDC tokens must be minted for: this server's public URL.
+    #[arg(long, env = "BRAINPROXY_SERVER_OIDC_AUDIENCE")]
+    oidc_audience: Option<String>,
     /// The brainproxy CLI to run.
     #[arg(long, env = "BRAINPROXY_BIN", default_value = "brainproxy")]
     brainproxy: PathBuf,
@@ -108,9 +116,16 @@ struct RemoteCommon {
     /// The target's id on the server.
     #[arg(long, env = "BRAINPROXY_SERVER_TARGET")]
     target: String,
-    /// Environment variable holding the target token.
+    /// Environment variable holding the target token, or a CI OIDC token the target binds
+    /// (GitLab `id_tokens`, Azure DevOps).
     #[arg(long, default_value = "BRAINPROXY_TOKEN")]
     token_env: String,
+    /// Get the token from the CI instead: `github` (needs `permissions: id-token: write`).
+    #[arg(long, value_name = "CI")]
+    oidc: Option<String>,
+    /// The audience to ask the CI for (default: --server); must match the server's --oidc-audience.
+    #[arg(long, requires = "oidc")]
+    audience: Option<String>,
     /// Give up waiting after this long (90s, 45m, 2h); the run goes on. Exit 2.
     #[arg(long, default_value = "90m", value_parser = remote::parse_duration)]
     timeout: std::time::Duration,
@@ -198,6 +213,10 @@ struct CiOpts {
     /// after this run. For a first run on an app with known issues; recorded in run.json.
     #[arg(long, conflicts_with = "fail_on")]
     baseline: bool,
+    /// Alert policy for the gate: per rule IGNORE, WARN or FAIL, as ZAP's rules file
+    /// (`10020<tab>IGNORE`) or JSON (`{"10020": "ignore"}`). Reports still list every finding.
+    #[arg(long, value_name = "FILE", conflicts_with = "baseline")]
+    policy: Option<PathBuf>,
     /// The brainproxy CLI to run.
     #[arg(long, env = "BRAINPROXY_BIN", default_value = "brainproxy")]
     brainproxy: PathBuf,
@@ -227,6 +246,8 @@ fn remote_args(c: RemoteCommon) -> remote::Args {
         server: c.server,
         target: c.target,
         token_env: c.token_env,
+        oidc: c.oidc,
+        audience: c.audience,
         run: None,
         commit: None,
         git_ref: None,
@@ -264,6 +285,14 @@ fn main() -> ExitCode {
 }
 
 fn serve(o: ServeOpts) -> i32 {
+    let oidc_issuers = match o.oidc_issuer.iter().map(|s| serve::oidc::Issuer::parse(s)).collect::<Result<Vec<_>, _>>()
+    {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("brainproxy-server: {e}");
+            return 1;
+        }
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -286,6 +315,8 @@ fn serve(o: ServeOpts) -> i32 {
         allow_network_fs: o.allow_network_fs,
         allow_loopback_targets: o.allow_loopback_targets,
         trust_forwarded: o.trust_forwarded,
+        oidc_issuers,
+        oidc_audience: o.oidc_audience,
     };
     match rt.block_on(serve::run(cfg)) {
         Ok(()) => 0,
@@ -297,6 +328,13 @@ fn serve(o: ServeOpts) -> i32 {
 }
 
 fn ci(o: CiOpts) -> i32 {
+    let policy = match o.policy.as_deref().map(policy::load).transpose() {
+        Ok(p) => p.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("brainproxy-server: --policy {e}");
+            return 1;
+        }
+    };
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -317,5 +355,6 @@ fn ci(o: CiOpts) -> i32 {
         auth: o.auth,
         accept_coverage_drop: o.accept_coverage_drop,
         baseline: o.baseline,
+        policy,
     }))
 }
