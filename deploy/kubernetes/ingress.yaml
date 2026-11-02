@@ -1,0 +1,33 @@
+# Optional: the public API over HTTPS, for pipelines outside the cluster. Enable it in
+# kustomization.yaml. TLS is required: tokens travel in the Authorization header.
+# Never add the admin API here (it is on loopback in the pod and has no Service).
+#
+# Written for ingress-nginx; change ingressClassName, the host and the TLS secret (or let
+# cert-manager issue it with its annotation).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: brainproxy-server
+  labels:
+    app.kubernetes.io/name: brainproxy-server
+  annotations:
+    # Run status requests long-poll for up to 60 seconds; the default read timeout is 60 too.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [scan.example.test]
+      secretName: brainproxy-server-tls
+  rules:
+    - host: scan.example.test
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: brainproxy-server
+                port:
+                  name: http

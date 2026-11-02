@@ -1,0 +1,58 @@
+# Only enforced by a CNI that implements NetworkPolicy (Calico, Cilium, Antrea, the AKS and GKE
+# network policy options, the VPC CNI with network policy enabled on EKS). Without one this object is
+# accepted and does nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: brainproxy-server
+  labels:
+    app.kubernetes.io/name: brainproxy-server
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: brainproxy-server
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # The public API, from the Ingress controller only. Change the namespace to yours.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 9090
+          protocol: TCP
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # The scan targets: the addresses of the registered targets' hosts, usually outside the cluster.
+    # 203.0.113.0/24 is a documentation placeholder; list each target's addresses and ports.
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP
+    # Only with object storage, webhooks or OIDC from CI (the issuers' keys): HTTPS out. This opens
+    # 443 to everything outside the cluster except the metadata address; narrow it to your storage
+    # endpoint's ranges, or send the traffic through an egress proxy, where you can.
+    # - to:
+    #     - ipBlock:
+    #         cidr: 0.0.0.0/0
+    #         except:
+    #           - 169.254.169.254/32
+    #   ports:
+    #     - port: 443
+    #       protocol: TCP

@@ -1,0 +1,30 @@
+# brainproxy-server on Kubernetes. See README.md here.
+#
+#   kubectl apply -k deploy/kubernetes
+#
+# Create the Secrets first (README.md, "Secrets"); they are not part of this kustomization so that
+# no secret value ends up in version control.
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: brainproxy
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: brainproxy-server
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - service.yaml
+  - statefulset.yaml
+  - networkpolicy.yaml
+  # Optional: a TLS Ingress for the public API. Check ingress.yaml before enabling it.
+  # - ingress.yaml
+
+# The image built from docker/server.Dockerfile and pushed to your registry. There is no published
+# image: replace OWNER and TAG (build with --build-arg CARGO_FEATURES=object-store for --store).
+images:
+  - name: ghcr.io/OWNER/brainproxy-server
+    newTag: TAG

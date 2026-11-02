@@ -1,0 +1,16 @@
+# The public API only. The admin API listens on 127.0.0.1 inside the pod and has no Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: brainproxy-server
+  labels:
+    app.kubernetes.io/name: brainproxy-server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: brainproxy-server
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+      protocol: TCP
