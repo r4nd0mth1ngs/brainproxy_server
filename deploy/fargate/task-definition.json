@@ -1,0 +1,91 @@
+{
+  "family": "brainproxy-server",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "cpu": "2048",
+  "memory": "8192",
+  "ephemeralStorage": {
+    "sizeInGiB": 50
+  },
+  "taskRoleArn": "arn:aws:iam::111122223333:role/brainproxy-server-task",
+  "executionRoleArn": "arn:aws:iam::111122223333:role/brainproxy-server-execution",
+  "volumes": [
+    {
+      "name": "work"
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "brainproxy-server",
+      "image": "111122223333.dkr.ecr.eu-west-1.amazonaws.com/brainproxy-server:TAG",
+      "essential": true,
+      "entryPoint": ["/sbin/tini", "-s", "--", "/bin/sh", "-c"],
+      "command": [
+        "umask 077 && printf '%s' \"$ADMIN_TOKEN\" > /tmp/admin_token && unset ADMIN_TOKEN && exec brainproxy-server serve --listen=0.0.0.0:9090 --admin-listen=127.0.0.1:9091 --admin-token-file=/tmp/admin_token --trust-forwarded"
+      ],
+      "portMappings": [
+        {
+          "name": "http",
+          "containerPort": 9090,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "BRAINPROXY_SERVER_STORE",
+          "value": "s3://my-brainproxy-bucket/brainproxy"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "eu-west-1"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "ADMIN_TOKEN",
+          "valueFrom": "arn:aws:secretsmanager:eu-west-1:111122223333:secret:brainproxy/admin-token-AbCdEf"
+        },
+        {
+          "name": "SHOP_DEV_APP_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:eu-west-1:111122223333:secret:brainproxy/shop-dev/app-password-AbCdEf"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "work",
+          "containerPath": "/work",
+          "readOnly": false
+        }
+      ],
+      "readonlyRootFilesystem": false,
+      "user": "1000:1000",
+      "linuxParameters": {
+        "capabilities": {
+          "drop": ["ALL"]
+        },
+        "initProcessEnabled": true
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/v1/healthz || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 300
+      },
+      "stopTimeout": 60,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/brainproxy-server",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "brainproxy",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

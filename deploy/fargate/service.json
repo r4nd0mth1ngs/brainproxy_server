@@ -1,0 +1,39 @@
+{
+  "cluster": "brainproxy",
+  "serviceName": "brainproxy-server",
+  "taskDefinition": "brainproxy-server",
+  "desiredCount": 1,
+  "launchType": "FARGATE",
+  "platformVersion": "LATEST",
+  "deploymentConfiguration": {
+    "minimumHealthyPercent": 0,
+    "maximumPercent": 100,
+    "deploymentCircuitBreaker": {
+      "enable": true,
+      "rollback": true
+    }
+  },
+  "networkConfiguration": {
+    "awsvpcConfiguration": {
+      "subnets": ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"],
+      "securityGroups": ["sg-0123456789abcdef0"],
+      "assignPublicIp": "DISABLED"
+    }
+  },
+  "loadBalancers": [
+    {
+      "targetGroupArn": "arn:aws:elasticloadbalancing:eu-west-1:111122223333:targetgroup/brainproxy-server/0123456789abcdef",
+      "containerName": "brainproxy-server",
+      "containerPort": 9090
+    }
+  ],
+  "healthCheckGracePeriodSeconds": 300,
+  "enableExecuteCommand": true,
+  "propagateTags": "SERVICE",
+  "tags": [
+    {
+      "key": "app",
+      "value": "brainproxy-server"
+    }
+  ]
+}
