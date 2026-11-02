@@ -241,7 +241,10 @@ projects and runs and then control.db, before it opens the API. Tokens, bindings
 ends incomplete. Removing a target removes its objects. A failed upload is logged and retried a
 minute later.
 
-One server per store: two would overwrite each other's control.db. The store holds what the
+One server per store: two would overwrite each other's control.db. A lease (`lease.json`,
+renewed every minute, given back on shutdown) makes a starting server wait up to 5 minutes for
+another's to end, then exit; a server whose lease was taken stops uploading. Deploy so the old
+container stops before the new one starts (see [deploy/](deploy/)). The store holds what the
 scans found (and the projects' recorded traffic), so give it a private bucket with encryption at
 rest and a role that only this server has. Secrets and the admin token are not in it.
 
