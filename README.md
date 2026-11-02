@@ -6,7 +6,8 @@ results with the previous scan, and reports what is new, fixed and unchanged. On
 at most 10 targets.
 
 Status: early development. `ci`, `serve` and `remote` work, with OIDC from CI, alert policies, an
-optional ownership check and a read-only results page.
+optional ownership check, a read-only results page, and webhooks (signed JSON, Slack, Teams) and
+DefectDojo reimports after each run.
 
 ## `brainproxy-server ci`
 
@@ -114,8 +115,8 @@ and gate); a pipeline then only names the target and gets a verdict.
 - **Limits.** At most 10 targets (compiled in). Per token: 10 triggers and 600 requests an hour.
   Failed authentications: 30 per address and listener per 10 minutes, then 429; valid credentials
   are never refused for others' failures. Bodies 64 KB; uploads `--max-project-mb`.
-- **Audit log.** Registrations, tokens, uploads, triggers, cancels, downloads and refused
-  authentications, in `control.db` and as JSON lines on stdout.
+- **Audit log.** Registrations, tokens, uploads, triggers, cancels, downloads, refused
+  authentications and notification deliveries, in `control.db` and as JSON lines on stdout.
 - **Storage.** `--work` (default `/work`) must be local disk: the server refuses NFS, SMB and FUSE.
   For disks that don't last, see [Object storage](#object-storage).
 
@@ -170,8 +171,55 @@ lists, and no profile stores a password in the file.
   `/.well-known/brainproxy-<id>.txt`, or the run fails with exit 6. It guards against registering
   the wrong host; like GitLab's site validation it is not a security feature.
 
-`PATCH /v1/targets/{t}` (admin) changes `oidc`, `policy` and `ownership`; the scope and URL only
-change with a new registration.
+`PATCH /v1/targets/{t}` (admin) changes `oidc`, `policy`, `ownership`, `notify` and `defectdojo`;
+the scope and URL only change with a new registration.
+
+### Notifications
+
+After a run ends the server sends its target's webhooks and, for a completed run, a DefectDojo
+reimport. They run on their own: a slow or failing receiver never delays or changes a run. Each
+delivery is in the audit log (`notify` or `defectdojo`, `ok` or `failed`) and failures also go to
+stderr, never with a URL or a secret.
+
+```json
+"notify": [
+  {"kind": "generic", "url_secret": "SHOP_HOOK_URL", "secret": "SHOP_HOOK_KEY"},
+  {"kind": "slack", "url_secret": "SHOP_SLACK_URL", "on": ["gate_failed", "incomplete", "error"]},
+  {"kind": "teams", "url_secret": "SHOP_TEAMS_URL", "on": ["passed", "gate_failed"]}
+],
+"defectdojo": {"url": "https://dojo.example.test", "token_secret": "SHOP_DOJO_TOKEN",
+               "product_name": "Shop", "engagement_name": "CI"}
+```
+
+- **URLs are secrets.** A Slack or Teams webhook URL is its own credential, so the configuration
+  names the secret that holds it, read like `secret_env`: the file `--secrets-dir/<target>/<NAME>`,
+  else the server's variable `NAME`. https only (http only to this machine), no redirects, 10 s,
+  three attempts (after 1 s and 5 s) on network errors, 5xx and 429. Proxies come from the
+  server's environment (`HTTPS_PROXY`), as for OIDC key fetches. At most 5 hooks per target.
+- **`on`**: `passed`, `gate_failed`, `incomplete`, `error`, `cancelled`; by default all but `passed`.
+  Runs superseded or cancelled while queued never ran and send nothing.
+- **`generic`** posts JSON: `event`, `target`, `run`, `state`, `outcome`, `exit_code`, `commit`, `ref`
+  and `pipeline_url` (when the trigger gave them), `gate` (`passed`, `count`, `fail_on`, `new_only`),
+  `drift`, `new_total` and up to 20 `new_findings` (`name`, `risk`, highest first), the first
+  `reasons`, and `links` (API paths of the run, its drift and reports). Headers:
+  `X-Brainproxy-Delivery` (the same on retries), `X-Brainproxy-Timestamp` (Unix seconds) and
+  `X-Brainproxy-Signature: sha256=<hex>`, the HMAC-SHA256 of `<timestamp>.<body>` with the key in
+  `secret`. A receiver recomputes it over the raw body, compares in constant time, and rejects
+  timestamps more than 5 minutes old; the delivery id tells a retry from a new event.
+- **`slack`** is an incoming webhook message and **`teams`** a Workflows webhook ("Post to a channel
+  when a webhook request is received") with an Adaptive Card 1.4. Both list up to 10 new findings;
+  commit labels, finding names and URLs are escaped so they can't become links or mentions.
+- **`defectdojo`** reimports the run's `report.sarif` (`POST /api/v2/reimport-scan/`, scan type
+  `SARIF`) after every completed run, passed or gate failed, as the test `test_title` (default
+  `brainproxy <target>`) in the product and engagement named, with `auto_create_context`, `active`
+  and `close_old_findings` (default true; false keeps findings the scan no longer sees), and
+  `minimum_severity` if given (`Info` to `Critical`). The product must exist; `token_secret` names
+  the secret with an API v2 key. 60 s, the same retries, reports up to 100 MB.
+
+```sh
+# Checking a generic webhook (TS and SIG from the headers, BODY the raw body):
+printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$KEY" | awk '{print "sha256=" $2}'
+```
 
 ### Object storage
 
@@ -202,7 +250,7 @@ rest and a role that only this server has. Secrets and the admin token are not i
 | Method and path | Who | |
 |---|---|---|
 | `POST /v1/targets`, `DELETE /v1/targets/{t}` | admin | Register or remove a target (at most 10) |
-| `PATCH /v1/targets/{t}` | admin | Change `oidc`, `policy`, `ownership` |
+| `PATCH /v1/targets/{t}` | admin | Change `oidc`, `policy`, `ownership`, `notify`, `defectdojo` |
 | `POST/GET /v1/targets/{t}/tokens`, `DELETE .../tokens/{id}` | admin | Issue, list, revoke tokens |
 | `PUT /v1/targets/{t}/project` | admin | Upload a project |
 | `POST /v1/targets/{t}/next-run` | admin | `{"baseline": true}` or `{"accept_coverage_drop": true}` for the next run only |
