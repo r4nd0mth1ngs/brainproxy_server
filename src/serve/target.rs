@@ -532,6 +532,11 @@ mod tests {
     fn secret_vars() {
         assert!(valid_secret_var("APP_PW"));
         assert!(valid_secret_var("SHOP_DEV_APP_PW"));
+        for platform in
+            ["AWS_SECRET_ACCESS_KEY", "AZURE_STORAGE_ACCOUNT_KEY", "IDENTITY_HEADER", "ECS_CONTAINER_METADATA_URI"]
+        {
+            assert!(!valid_secret_var(platform), "{platform}");
+        }
         for bad in
             ["PATH", "HOME", "LD_PRELOAD", "BRAINPROXY_HOME", "BRAINPROXY_SYSTEM_SCOPE", "HTTPS_PROXY", "app", "1X"]
         {
