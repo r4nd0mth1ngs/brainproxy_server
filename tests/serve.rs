@@ -1032,7 +1032,9 @@ fn a_fresh_work_directory_is_restored_from_the_store() {
     let Some(cli) = cli() else { return };
     let dir = tempfile::tempdir().unwrap();
     let bucket = dir.path().join("bucket");
-    let store = format!("file://{}/brainproxy", bucket.display());
+    // BPS_TEST_STORE runs this against a real store (e.g. MinIO: s3://bucket/prefix with AWS_*).
+    let real = std::env::var("BPS_TEST_STORE").ok();
+    let store = real.clone().unwrap_or_else(|| format!("file://{}/brainproxy", bucket.display()));
     let app = App::start(4);
 
     // The first server: a baseline run, then a container stop.
@@ -1045,8 +1047,10 @@ fn a_fresh_work_directory_is_restored_from_the_store() {
     one.stop();
     let run1 = r1["run"].as_str().unwrap();
     let objects = bucket.join("brainproxy");
-    for f in ["control.db", "targets/shop/project.bpdb", &format!("targets/shop/runs/{run1}/run.json")] {
-        assert!(objects.join(f).is_file(), "{f} isn't in the store: {}", one.log());
+    if real.is_none() {
+        for f in ["control.db", "targets/shop/project.bpdb", &format!("targets/shop/runs/{run1}/run.json")] {
+            assert!(objects.join(f).is_file(), "{f} isn't in the store: {}", one.log());
+        }
     }
 
     // A new server on an empty disk: the target, its token and its history come back, so the next
@@ -1064,7 +1068,7 @@ fn a_fresh_work_directory_is_restored_from_the_store() {
     // Removing the target removes its objects.
     assert_eq!(two.admin("DELETE", "/v1/targets/shop", None).0, 200);
     let start = Instant::now();
-    while objects.join("targets/shop/project.bpdb").exists() {
+    while real.is_none() && objects.join("targets/shop/project.bpdb").exists() {
         assert!(start.elapsed() < Duration::from_secs(30), "objects stayed: {}", two.log());
         std::thread::sleep(Duration::from_millis(200));
     }
