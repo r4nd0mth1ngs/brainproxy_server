@@ -280,7 +280,9 @@ sent as an `Authorization` header (downloads too), never in a URL.
 
 [`deploy/compose/`](deploy/compose/) runs it with Caddy for TLS (the reference deployment; the same
 on EC2, an Azure VM or your own servers), built from [`docker/server.Dockerfile`](docker/server.Dockerfile).
-One replica only.
+[`deploy/kubernetes/`](deploy/kubernetes/) has manifests for a StatefulSet;
+[`deploy/fargate/`](deploy/fargate/) and [`deploy/azure-container-apps/`](deploy/azure-container-apps/)
+are examples that keep the state in object storage. One replica only.
 
 ## `brainproxy-server remote`
 
