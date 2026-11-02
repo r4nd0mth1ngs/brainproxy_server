@@ -42,7 +42,9 @@ curl https://$(az containerapp show -g RG -n brainproxy-server --query propertie
 `minReplicas` and `maxReplicas` are 1. Container Apps still starts a new revision before it stops
 the old one when you change the app, so for a short time two servers run against the same
 container. To upgrade without that overlap, deactivate the running revision first (this stops the
-server; wait until no run is running, `GET /v1/summary`), then update:
+server; wait until no run is running, `GET /v1/summary`), then update. If you don't, the store's
+lease keeps the new revision waiting (up to 5 minutes, then it exits and the revision fails)
+while the old one runs, so the two never write at once:
 
 ```sh
 az containerapp revision deactivate -g RG -n brainproxy-server \

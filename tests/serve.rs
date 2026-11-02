@@ -1044,11 +1044,25 @@ fn a_fresh_work_directory_is_restored_from_the_store() {
     assert_eq!(one.admin("POST", "/v1/targets/shop/next-run", Some(json!({"baseline": true}))).0, 200);
     let (code, r1) = remote(&one, &tok, &["run", "--target", "shop", "--commit", "c1"]);
     assert_eq!(code, 0, "{r1}");
+    // Admin changes are in the store before the answer: a revoked token stays revoked.
+    let other = one.token("shop", "read");
+    let (_, tokens) = one.admin("GET", "/v1/targets/shop/tokens", None);
+    let list = tokens["data"]["tokens"].as_array().unwrap();
+    let id = list.iter().find(|t| t["perm"] == "read").unwrap()["id"].as_str().unwrap().to_string();
+    let resp = one
+        .agent
+        .delete(&format!("http://127.0.0.1:{}/v1/targets/shop/tokens/{id}", one.admin))
+        .header("Authorization", &format!("Bearer {}", one.admin_token))
+        .call()
+        .unwrap();
+    assert_eq!(resp.headers().get("x-brainproxy-store").map(|v| v.to_str().unwrap()), Some("synced"));
     one.stop();
     let run1 = r1["run"].as_str().unwrap();
     let objects = bucket.join("brainproxy");
     if real.is_none() {
-        for f in ["control.db", "targets/shop/project.bpdb", &format!("targets/shop/runs/{run1}/run.json")] {
+        for f in
+            ["control.db", "manifest.json", "targets/shop/project.bpdb", &format!("targets/shop/runs/{run1}/run.json")]
+        {
             assert!(objects.join(f).is_file(), "{f} isn't in the store: {}", one.log());
         }
     }
@@ -1060,6 +1074,7 @@ fn a_fresh_work_directory_is_restored_from_the_store() {
     let (status, runs) = two.get_public("/v1/targets/shop/runs", Some(&tok));
     assert_eq!(status, 200, "{runs}");
     assert!(runs.to_string().contains(run1), "{runs}");
+    assert_eq!(two.get_public("/v1/targets/shop", Some(&other)).0, 401, "the revoked token came back");
     let (code, r2) = remote(&two, &tok, &["run", "--target", "shop", "--commit", "c2"]);
     assert_eq!(code, 0, "{r2}\n{}", two.log());
     assert_eq!(r2["drift"]["since_job"], r1["job"], "{r2}");

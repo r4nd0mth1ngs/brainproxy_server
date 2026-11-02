@@ -101,6 +101,9 @@ and gate); a pipeline then only names the target and gets a verdict.
 - **Secrets.** A target's `secret_env` maps the variables its auth profile reads to files
   `--secrets-dir/<target>/<VARIABLE>` (Docker and Kubernetes secrets) or the server's environment.
   Every CLI process gets a cleared environment with a small allowlist plus its own target's secrets.
+  Files keep secrets per target; the environment is shared, so any target's configuration can name
+  any variable in it (but not the platform's and the store's credentials: `AWS_*`, `AZURE_*`,
+  `IDENTITY_*`, `MSI_*`, `ECS_*` and the like). Prefer files where the platform can mount them.
 - **Queue.** One running and one queued run per target, at most `--max-parallel` (3) scans. A newer
   trigger replaces the queued run, which ends as `superseded`. A trigger from the same token with the
   same `commit` and preset while that run is still queued returns it; a finished run is never
@@ -208,13 +211,15 @@ stderr, never with a URL or a secret.
   timestamps more than 5 minutes old; the delivery id tells a retry from a new event.
 - **`slack`** is an incoming webhook message and **`teams`** a Workflows webhook ("Post to a channel
   when a webhook request is received") with an Adaptive Card 1.4. Both list up to 10 new findings;
-  commit labels, finding names and URLs are escaped so they can't become links or mentions.
+  commit labels and finding names are escaped so they can't become mentions or masked links, and
+  `pipeline_url` takes URL characters only; chat apps still turn plain URLs into links.
 - **`defectdojo`** reimports the run's `report.sarif` (`POST /api/v2/reimport-scan/`, scan type
   `SARIF`) after every completed run, passed or gate failed, as the test `test_title` (default
   `brainproxy <target>`) in the product and engagement named, with `auto_create_context`, `active`
   and `close_old_findings` (default true; false keeps findings the scan no longer sees), and
   `minimum_severity` if given (`Info` to `Critical`). The product must exist; `token_secret` names
-  the secret with an API v2 key. 60 s, the same retries, reports up to 100 MB.
+  the secret with an API v2 key. 5 minutes, the same retries except after a timeout (DefectDojo
+  may still be importing), reports up to 100 MB.
 
 ```sh
 # Checking a generic webhook (TS and SIG from the headers, BODY the raw body):
@@ -233,20 +238,31 @@ Where the disk doesn't outlive the container (AWS Fargate, Azure Container Apps)
   (`AZURE_*` variables).
 - `file:///path`, for trying it out.
 
-A few seconds after each run ends, and after each admin change, the server copies control.db (a
-consistent copy), the target's newest project snapshot and the run's folder there, and once more
-on shutdown. Started with no control.db in `--work` and one in the store, it restores the targets'
-projects and runs and then control.db, before it opens the API. Tokens, bindings and the
-"new since" history come back with them; a run that was running when the old container stopped
-ends incomplete. Removing a target removes its objects. A failed upload is logged and retried a
-minute later.
+A few seconds after each run ends the server copies control.db (a consistent copy), the target's
+newest project snapshot and the run's folder there; admin changes are copied before the admin API
+answers (`X-Brainproxy-Store: synced`, or `pending` when the store couldn't be reached), and
+everything once more on shutdown. Started with no control.db in `--work` and one in the store, it
+restores the targets' projects and runs and then control.db, before it opens the API. Tokens,
+bindings and the "new since" history come back with them; a run that was running when the old
+container stopped ends incomplete. Removing a target removes its objects. A failed upload is
+logged and retried a minute later.
+
+`manifest.json` lists every object's SHA-256 and is signed with a key derived from the admin
+token, which the store never holds. A restore takes only what it lists, checks each hash, and
+refuses a manifest that doesn't verify: someone who can write to the bucket can't plant a
+target, a token or a file. They can still delete objects or put back an older signed state (and a
+token revoked since), so the bucket stays the server's alone. A new admin token signs from the
+next upload on; restore before rotating it, or the old manifest won't verify.
 
 One server per store: two would overwrite each other's control.db. A lease (`lease.json`,
 renewed every minute, given back on shutdown) makes a starting server wait up to 5 minutes for
-another's to end, then exit; a server whose lease was taken stops uploading. Deploy so the old
-container stops before the new one starts (see [deploy/](deploy/)). The store holds what the
-scans found (and the projects' recorded traffic), so give it a private bucket with encryption at
-rest and a role that only this server has. Secrets and the admin token are not in it.
+another's to end, then exit; a server whose lease another took exits too. Deploy so the old
+container stops before the new one starts (see [deploy/](deploy/)).
+
+The store holds what the scans recorded: projects and reports carry the targets' login requests
+(with the passwords from `secret_env`), session cookies and tokens. Give it a private bucket with
+encryption at rest (SSE-KMS or a customer-managed key) and a role only this server has. control.db
+holds token hashes, not tokens; the admin token and the secret files are not in the store.
 
 ### Endpoints
 

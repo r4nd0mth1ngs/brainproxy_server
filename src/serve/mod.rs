@@ -153,7 +153,7 @@ pub struct Server {
     /// Registrations, uploads and removals, one at a time.
     admin_ops: tokio::sync::Mutex<()>,
     /// Where the work directory is copied to, and the task copying it.
-    store: Option<store::Store>,
+    store: Option<Arc<store::Store>>,
     sync: OnceLock<store::Sync>,
     _lock: File,
 }
@@ -182,19 +182,21 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         );
     }
     let lock = lock_work(&cfg.work)?;
+    let admin_hash = auth::load_admin_token(&cfg.admin_token_file)?;
     let store = match &cfg.store {
-        Some(url) => Some(store::Store::open(url)?),
+        Some(url) => Some(Arc::new(store::Store::open(url, &admin_hash, &cfg.work)?)),
         None => None,
     };
     let mut first_sync = false;
     if let Some(s) = &store {
         s.acquire(store::LEASE_WAIT).await?;
+        store::keep_lease(s.clone());
         match store::restore(s, &cfg.work).await? {
             Some(n) => eprintln!("brainproxy-server: restored control.db and {n} target(s) from {}", s.url),
-            None => first_sync = !s.has("control.db").await?,
+            // No local manifest: this server hasn't uploaded yet (or is new to this store).
+            None => first_sync = s.fresh,
         }
     }
-    let admin_hash = auth::load_admin_token(&cfg.admin_token_file)?;
     let version = brainproxy::check_version(&cfg.brainproxy, Some(&base_env(&cfg))).await?;
     let db = Db::open(&cfg.work.join("control.db")).map_err(|e| format!("control.db: {e}"))?;
     if !cfg.admin_listen.ip().is_loopback() {
@@ -349,8 +351,9 @@ impl Server {
         if let Err(err) = self.db().audit(&e) {
             eprintln!("brainproxy-server: can't write the audit log: {err}");
         }
-        // Admin operations change control.db; failed sign-ins only add audit lines.
-        if e.action != "authenticate" {
+        // Admin operations change what a restore must bring back; others only add audit lines,
+        // which the next upload (after a run, say) takes along.
+        if e.actor_kind == "admin" {
             self.sync(store::Item::Control);
         }
     }
@@ -671,6 +674,11 @@ impl Server {
         for old in &snaps[..extra] {
             let _ = std::fs::remove_file(old);
         }
+    }
+
+    /// Uploads pending changes now; `None` without a store, else whether everything made it.
+    pub async fn persist(&self) -> Option<bool> {
+        Some(self.sync.get()?.flush(Duration::from_secs(30)).await)
     }
 
     /// A consistent copy of a target's project at `path` (`project save`).

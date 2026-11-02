@@ -122,7 +122,27 @@ pub fn admin_router(server: Arc<Server>) -> Router {
         .route("/v1/targets/{t}/next-run", post(next_run))
         .route("/v1/summary", get(summary))
         .route("/v1/audit", get(audit_log))
+        .layer(axum::middleware::from_fn_with_state(server.clone(), persist_changes))
         .with_state(App { server, admin: true })
+}
+
+/// Admin changes reach the store before the answer, so a restart onto an empty disk can't undo a
+/// revocation; `X-Brainproxy-Store: pending` says when they didn't (yet).
+async fn persist_changes(
+    State(server): State<Arc<Server>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let write = req.method() != axum::http::Method::GET;
+    let mut resp = next.run(req).await;
+    if write
+        && resp.status().is_success()
+        && let Some(synced) = server.persist().await
+    {
+        let v = HeaderValue::from_static(if synced { "synced" } else { "pending" });
+        resp.headers_mut().insert("x-brainproxy-store", v);
+    }
+    resp
 }
 
 fn common(r: Router<App>) -> Router<App> {
@@ -308,10 +328,15 @@ async fn healthz(State(app): State<App>) -> ApiResult {
     ok(StatusCode::OK, json!({"status": "ok", "version": env!("CARGO_PKG_VERSION"), "running": live}))
 }
 
-fn target_json(app: &App, t: &db::Target) -> Result<Value, ApiError> {
+fn target_json(app: &App, t: &db::Target, caller: &Caller) -> Result<Value, ApiError> {
     let counts = app.server.db().state_counts(&t.config.id).map_err(ApiError::db)?;
     let mut v = t.config.public_json();
     if let Some(m) = v.as_object_mut() {
+        // Where results go (internal hosts, secret names) is the admin's business.
+        if !matches!(caller, Caller::Admin) {
+            m.remove("notify");
+            m.remove("defectdojo");
+        }
         m.insert("project_ready".into(), json!(t.project_ready));
         m.insert("created".into(), json!(time::format_millis(t.created)));
         m.insert(
@@ -337,7 +362,7 @@ async fn list_targets(
         Caller::Token(tok) => tok.target == t.config.id,
         Caller::Oidc(_) => false,
     }) {
-        out.push(target_json(&app, t)?);
+        out.push(target_json(&app, t, &caller)?);
     }
     ok(StatusCode::OK, json!({"targets": out, "max_targets": db::MAX_TARGETS}))
 }
@@ -349,9 +374,9 @@ async fn show_target(
     Path(t): Path<String>,
 ) -> ApiResult {
     let ip = client_ip(&app, peer, &headers);
-    authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
+    let caller = authenticate(&app, ip, &headers, Some(&t), Perm::Read).await?;
     let target = load_target(&app, &t)?;
-    ok(StatusCode::OK, target_json(&app, &target)?)
+    ok(StatusCode::OK, target_json(&app, &target, &caller)?)
 }
 
 /// A run as the API shows it (research §4.2).
@@ -574,9 +599,12 @@ async fn trigger(
     if let Some(u) = &b.pipeline_url
         && (u.len() > 500
             || !(u.starts_with("https://") || u.starts_with("http://"))
-            || u.chars().any(char::is_control))
+            || !u.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()+,;=%".contains(&b)))
     {
-        return Err(ApiError::invalid("pipeline_url must be an http(s) URL of at most 500 characters"));
+        // URL characters only: no spaces or markup that would read as a message in chat.
+        return Err(ApiError::invalid(
+            "pipeline_url must be an http(s) URL of at most 500 characters, without spaces or markup",
+        ));
     }
     let preset = match &b.preset {
         None => target.config.preset.clone(),

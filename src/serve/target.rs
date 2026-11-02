@@ -40,6 +40,11 @@ pub fn valid_secret_var(name: &str) -> bool {
         && !name.starts_with("LC_")
         && !name.starts_with("RUST")
         && !name.ends_with("_PROXY")
+        // The platform's and the object store's credentials, which the server's environment holds.
+        && !["AWS_", "AZURE_", "IDENTITY_", "MSI_", "ECS_", "GOOGLE_", "KUBERNETES_", "ARM_"]
+            .iter()
+            .any(|p| name.starts_with(p))
+        && name != "HOSTNAME"
 }
 
 pub const PRESETS: [&str; 3] = ["quick", "standard", "thorough"];

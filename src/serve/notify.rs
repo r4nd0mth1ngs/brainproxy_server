@@ -346,6 +346,7 @@ fn agent(timeout: Duration) -> ureq::Agent {
 
 /// Up to three attempts, after network errors, 5xx and 429. Returns the 2xx status.
 fn with_retries(
+    retry_timeouts: bool,
     mut send: impl FnMut() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
 ) -> Result<u16, Failure> {
     let mut last = Failure::short(String::new());
@@ -368,6 +369,8 @@ fn with_retries(
                     return Err(last);
                 }
             }
+            // A timed-out upload may still be processed: sending it again would import it twice.
+            Err(e @ ureq::Error::Timeout(_)) if !retry_timeouts => return Err(Failure::short(describe(&e))),
             Err(e) => last = Failure::short(describe(&e)),
         }
     }
@@ -391,7 +394,7 @@ fn describe(e: &ureq::Error) -> String {
 fn send_hook(url: &str, key: Option<&str>, body: &str) -> Result<u16, Failure> {
     let agent = agent(Duration::from_secs(10));
     let delivery = format!("d-{}", auth::base32(&auth::random_bytes::<10>()));
-    with_retries(|| {
+    with_retries(true, || {
         let mut req =
             agent.post(url).header("Content-Type", "application/json").header("X-Brainproxy-Delivery", &delivery);
         if let Some(key) = key {
@@ -440,8 +443,8 @@ fn reimport(dojo: &DefectDojo, token: &str, test_title: &str, report: &std::path
     if !oidc::secure_url(&url) {
         return Err(Failure::short("defectdojo.url must be https://".into()));
     }
-    let agent = agent(Duration::from_secs(60));
-    with_retries(|| {
+    let agent = agent(Duration::from_secs(300));
+    with_retries(false, || {
         agent
             .post(&url)
             .header("Authorization", &format!("Token {token}"))
