@@ -12,9 +12,11 @@ publish = false
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
+futures-util = { version = "0.3", default-features = false, optional = true }
 getrandom = "0.3"
 http-body-util = "0.1.5"
 libc = "0.2.191"
+object_store = { version = "0.14", optional = true, default-features = false, features = ["aws", "azure", "fs"] }
 ring = "0.17"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,9 +24,14 @@ serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt", "macros", "process", "signal", "sync", "time", "rt-multi-thread", "net", "fs", "io-util"] }
 ureq = { version = "3.5.0", features = ["platform-verifier", "json"] }
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [profile.release]
 strip = true
+
+[features]
+# Object storage (S3, MinIO, Azure Blob) for syncing the work directory and restoring it on start.
+object-store = ["dep:object_store", "dep:url", "dep:futures-util"]

@@ -5,5 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo fmt --check
 cargo clippy --all-targets -q -- -D warnings
-cargo test -q
+cargo clippy --all-targets --all-features -q -- -D warnings
+cargo test -q --all-features
 echo "checks passed"

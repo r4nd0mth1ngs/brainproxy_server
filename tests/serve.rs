@@ -104,6 +104,19 @@ impl Server {
         }
     }
 
+    /// SIGTERM, as a container stop sends, and waits for the exit.
+    #[cfg(feature = "object-store")]
+    fn stop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            Command::new("kill").args(["-TERM", &c.id().to_string()]).status().unwrap();
+            let start = Instant::now();
+            while c.try_wait().unwrap().is_none() {
+                assert!(start.elapsed() < Duration::from_secs(30), "server didn't stop: {}", self.log());
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
     fn request(&self, method: &str, port: u16, path: &str, token: Option<&str>, body: Option<&Value>) -> (u16, Value) {
         let url = format!("http://127.0.0.1:{port}{path}");
         let auth = token.map(|t| format!("Bearer {t}"));
@@ -1011,4 +1024,48 @@ fn alert_policies_and_the_ownership_check() {
     // The token stays the same while ownership stays on.
     let (_, v) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"ownership": true})));
     assert_eq!(v["data"]["ownership_token"], owner_token.as_str());
+}
+
+#[cfg(feature = "object-store")]
+#[test]
+fn a_fresh_work_directory_is_restored_from_the_store() {
+    let Some(cli) = cli() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let bucket = dir.path().join("bucket");
+    let store = format!("file://{}/brainproxy", bucket.display());
+    let app = App::start(4);
+
+    // The first server: a baseline run, then a container stop.
+    let mut one = Server::start(&dir.path().join("one"), &cli, &["--store", &store]);
+    one.register("shop", &app, json!({"gate": {"fail_on": "high", "new_only": true}}));
+    let tok = one.token("shop", "trigger");
+    assert_eq!(one.admin("POST", "/v1/targets/shop/next-run", Some(json!({"baseline": true}))).0, 200);
+    let (code, r1) = remote(&one, &tok, &["run", "--target", "shop", "--commit", "c1"]);
+    assert_eq!(code, 0, "{r1}");
+    one.stop();
+    let run1 = r1["run"].as_str().unwrap();
+    let objects = bucket.join("brainproxy");
+    for f in ["control.db", "targets/shop/project.bpdb", &format!("targets/shop/runs/{run1}/run.json")] {
+        assert!(objects.join(f).is_file(), "{f} isn't in the store: {}", one.log());
+    }
+
+    // A new server on an empty disk: the target, its token and its history come back, so the next
+    // run compares with run 1.
+    let two = Server::start(&dir.path().join("two"), &cli, &["--store", &store]);
+    assert!(two.log().contains("restored control.db and 1 target"), "{}", two.log());
+    let (status, runs) = two.get_public("/v1/targets/shop/runs", Some(&tok));
+    assert_eq!(status, 200, "{runs}");
+    assert!(runs.to_string().contains(run1), "{runs}");
+    let (code, r2) = remote(&two, &tok, &["run", "--target", "shop", "--commit", "c2"]);
+    assert_eq!(code, 0, "{r2}\n{}", two.log());
+    assert_eq!(r2["drift"]["since_job"], r1["job"], "{r2}");
+    assert!(r2["drift"]["unchanged"].as_u64().unwrap() > 0, "{r2}");
+
+    // Removing the target removes its objects.
+    assert_eq!(two.admin("DELETE", "/v1/targets/shop", None).0, 200);
+    let start = Instant::now();
+    while objects.join("targets/shop/project.bpdb").exists() {
+        assert!(start.elapsed() < Duration::from_secs(30), "objects stayed: {}", two.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }

@@ -285,6 +285,12 @@ impl Db {
         Ok(())
     }
 
+    /// A consistent copy of the whole database at `path`, which must not exist yet.
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        self.conn.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+        Ok(())
+    }
+
     pub fn update_config(&self, config: &TargetConfig) -> Result<()> {
         let text = serde_json::to_string(config).unwrap_or_default();
         self.conn.execute("UPDATE targets SET config = ?2 WHERE id = ?1", params![config.id, text])?;

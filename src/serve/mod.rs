@@ -16,6 +16,7 @@ pub mod api;
 pub mod auth;
 pub mod db;
 pub mod oidc;
+pub mod store;
 pub mod target;
 pub mod ui;
 
@@ -24,7 +25,7 @@ use std::ffi::OsString;
 use std::fs::{File, TryLockError};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -61,6 +62,8 @@ pub struct Config {
     pub oidc_issuers: Vec<oidc::Issuer>,
     /// The `aud` OIDC tokens must carry: the server's public URL.
     pub oidc_audience: Option<String>,
+    /// Object storage the work directory is copied to and restored from (`object-store` feature).
+    pub store: Option<String>,
 }
 
 /// What `PATCH /v1/targets/{t}` may change.
@@ -135,6 +138,9 @@ pub struct Server {
     busy: Mutex<HashSet<String>>,
     /// Registrations, uploads and removals, one at a time.
     admin_ops: tokio::sync::Mutex<()>,
+    /// Where the work directory is copied to, and the task copying it.
+    store: Option<store::Store>,
+    sync: OnceLock<store::Sync>,
     _lock: File,
 }
 
@@ -162,6 +168,17 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         );
     }
     let lock = lock_work(&cfg.work)?;
+    let store = match &cfg.store {
+        Some(url) => Some(store::Store::open(url)?),
+        None => None,
+    };
+    let mut first_sync = false;
+    if let Some(s) = &store {
+        match store::restore(s, &cfg.work).await? {
+            Some(n) => eprintln!("brainproxy-server: restored control.db and {n} target(s) from {}", s.url),
+            None => first_sync = !s.has("control.db").await?,
+        }
+    }
     let admin_hash = auth::load_admin_token(&cfg.admin_token_file)?;
     let version = brainproxy::check_version(&cfg.brainproxy, Some(&base_env(&cfg))).await?;
     let db = Db::open(&cfg.work.join("control.db")).map_err(|e| format!("control.db: {e}"))?;
@@ -192,8 +209,16 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         live: Mutex::new(HashMap::new()),
         busy: Mutex::new(HashSet::new()),
         admin_ops: tokio::sync::Mutex::new(()),
+        store,
+        sync: OnceLock::new(),
         _lock: lock,
     });
+    if server.store.is_some() {
+        let _ = server.sync.set(store::start(server.clone()));
+        if first_sync {
+            server.sync_everything();
+        }
+    }
     server.prune();
     server.write_system_scope().map_err(|e| format!("system scope: {e}"))?;
 
@@ -248,6 +273,9 @@ pub async fn run(cfg: Config) -> Result<(), String> {
         let _ = admin_task.await;
     })
     .await;
+    if let Some(sync) = server.sync.get() {
+        sync.flush(Duration::from_secs(20)).await;
+    }
     Ok(())
 }
 
@@ -302,6 +330,10 @@ impl Server {
         );
         if let Err(err) = self.db().audit(&e) {
             eprintln!("brainproxy-server: can't write the audit log: {err}");
+        }
+        // Admin operations change control.db; failed sign-ins only add audit lines.
+        if e.action != "authenticate" {
+            self.sync(store::Item::Control);
         }
     }
 
@@ -458,6 +490,9 @@ impl Server {
             }
             self.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.runs_changed();
+            self.sync(store::Item::Run { target: target.clone(), run: id.clone() });
+            let snapshot = self.target_dir(&target).join("snapshots").join(format!("{id}.bpdb"));
+            self.sync(store::Item::Project { target, snapshot: Some(snapshot) });
         });
     }
 
@@ -602,11 +637,8 @@ impl Server {
             return;
         }
         let dir = self.target_dir(target).join("snapshots");
-        let path = dir.join(format!("{run}.bpdb"));
-        match cli.run([OsString::from("project"), "save".into(), "--output".into(), path.into_os_string()]).await {
-            Ok(out) if out.ok() => {}
-            Ok(out) => eprintln!("brainproxy-server: snapshot of {target} after {run}: {}", out.message()),
-            Err(e) => eprintln!("brainproxy-server: snapshot of {target} after {run}: {e}"),
+        if let Err(e) = save(cli, &dir.join(format!("{run}.bpdb"))).await {
+            eprintln!("brainproxy-server: snapshot of {target} after {run}: {e}");
         }
         let mut snaps: Vec<PathBuf> = std::fs::read_dir(&dir)
             .map(|d| {
@@ -620,6 +652,25 @@ impl Server {
         for old in &snaps[..extra] {
             let _ = std::fs::remove_file(old);
         }
+    }
+
+    /// A consistent copy of a target's project at `path` (`project save`).
+    async fn save_project(&self, target: &str, path: &Path) -> Result<(), String> {
+        save(&self.cli(self.target_dir(target).join("project.bpdb"), base_env(&self.cfg)), path).await
+    }
+
+    /// Queues everything for the store: on the first start with an empty store.
+    fn sync_everything(&self) {
+        let targets = self.db().targets().unwrap_or_default();
+        for t in targets {
+            let id = t.config.id;
+            let runs = std::fs::read_dir(self.target_dir(&id).join("runs")).into_iter().flatten().flatten();
+            for run in runs.filter(|r| r.path().is_dir()) {
+                self.sync(store::Item::Run { target: id.clone(), run: run.file_name().to_string_lossy().into() });
+            }
+            self.sync(store::Item::Project { target: id, snapshot: None });
+        }
+        self.sync(store::Item::Control);
     }
 
     // -- admin operations ------------------------------------------------------------------------
@@ -660,6 +711,9 @@ impl Server {
             return Err(if e.to_string().contains("at most") { ApiError::limit() } else { ApiError::db(e) });
         }
         self.write_system_scope().map_err(ApiError::io)?;
+        if ready {
+            self.sync(store::Item::Project { target: t.id.clone(), snapshot: None });
+        }
         Ok(json!({
             "id": t.id, "created": true, "project_ready": ready,
             "next": if ready {
@@ -871,6 +925,7 @@ impl Server {
         }
         std::fs::rename(&clean, &project).map_err(ApiError::io)?;
         self.db().set_project_ready(id).map_err(ApiError::db)?;
+        self.sync(store::Item::Project { target: id.to_string(), snapshot: None });
         Ok(json!({"target": id, "project_ready": true, "scope": e["include"], "profiles": names}))
     }
 
@@ -902,8 +957,18 @@ impl Server {
             }
             self.db().delete_target(id).map_err(ApiError::db)?;
             self.write_system_scope().map_err(ApiError::io)?;
+            self.sync(store::Item::Removed { target: id.to_string() });
             Ok(json!({"id": id, "removed": true, "moved_to": to}))
         })()
+    }
+}
+
+/// `project save --output path`.
+async fn save(cli: &Cli, path: &Path) -> Result<(), String> {
+    match cli.run([OsString::from("project"), "save".into(), "--output".into(), path.as_os_str().to_owned()]).await {
+        Ok(out) if out.ok() => Ok(()),
+        Ok(out) => Err(out.message()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

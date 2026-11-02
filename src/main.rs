@@ -93,6 +93,12 @@ struct ServeOpts {
     /// The audience OIDC tokens must be minted for: this server's public URL.
     #[arg(long, env = "BRAINPROXY_SERVER_OIDC_AUDIENCE")]
     oidc_audience: Option<String>,
+    /// Copy the work directory to object storage and restore it from there when WORK is empty:
+    /// `s3://bucket/prefix` (MinIO: with AWS_ENDPOINT), `az://container/prefix` or `file:///path`.
+    /// Credentials come from AWS_* and AZURE_* variables. One server per store. Needs a build with
+    /// the object-store feature.
+    #[arg(long, env = "BRAINPROXY_SERVER_STORE", value_name = "URL")]
+    store: Option<String>,
     /// The brainproxy CLI to run.
     #[arg(long, env = "BRAINPROXY_BIN", default_value = "brainproxy")]
     brainproxy: PathBuf,
@@ -317,6 +323,7 @@ fn serve(o: ServeOpts) -> i32 {
         trust_forwarded: o.trust_forwarded,
         oidc_issuers,
         oidc_audience: o.oidc_audience,
+        store: o.store,
     };
     match rt.block_on(serve::run(cfg)) {
         Ok(()) => 0,

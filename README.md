@@ -117,6 +117,7 @@ and gate); a pipeline then only names the target and gets a verdict.
 - **Audit log.** Registrations, tokens, uploads, triggers, cancels, downloads and refused
   authentications, in `control.db` and as JSON lines on stdout.
 - **Storage.** `--work` (default `/work`) must be local disk: the server refuses NFS, SMB and FUSE.
+  For disks that don't last, see [Object storage](#object-storage).
 
 ```sh
 openssl rand -hex 32 > admin_token && chmod 600 admin_token
@@ -171,6 +172,30 @@ lists, and no profile stores a password in the file.
 
 `PATCH /v1/targets/{t}` (admin) changes `oidc`, `policy` and `ownership`; the scope and URL only
 change with a new registration.
+
+### Object storage
+
+Where the disk doesn't outlive the container (AWS Fargate, Azure Container Apps), build with
+`--features object-store` and start with `--store URL` (or `BRAINPROXY_SERVER_STORE`):
+
+- `s3://bucket/prefix`; for MinIO add `AWS_ENDPOINT=https://minio.example.test:9000` (and
+  `AWS_ALLOW_HTTP=true` for plain http). Credentials from `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+  and `AWS_REGION`, or the task role.
+- `az://container/prefix`, with `AZURE_STORAGE_ACCOUNT_NAME` and a key, SAS or managed identity
+  (`AZURE_*` variables).
+- `file:///path`, for trying it out.
+
+A few seconds after each run ends, and after each admin change, the server copies control.db (a
+consistent copy), the target's newest project snapshot and the run's folder there, and once more
+on shutdown. Started with no control.db in `--work` and one in the store, it restores the targets'
+projects and runs and then control.db, before it opens the API. Tokens, bindings and the
+"new since" history come back with them; a run that was running when the old container stopped
+ends incomplete. Removing a target removes its objects. A failed upload is logged and retried a
+minute later.
+
+One server per store: two would overwrite each other's control.db. The store holds what the
+scans found (and the projects' recorded traffic), so give it a private bucket with encryption at
+rest and a role that only this server has. Secrets and the admin token are not in it.
 
 ### Endpoints
 
