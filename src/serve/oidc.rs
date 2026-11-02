@@ -25,6 +25,8 @@ pub const AZURE_AUDIENCE: &str = "api://AzureADTokenExchange";
 const LEEWAY_SECS: i64 = 60;
 /// Keys are fetched again after this long.
 const JWKS_TTL: Duration = Duration::from_secs(600);
+/// Keys older than this are no longer used, even when the issuer can't be reached.
+const JWKS_STALE: Duration = Duration::from_secs(24 * 3600);
 /// An unknown `kid` fetches the keys again, but not more often than this.
 const JWKS_REFETCH: Duration = Duration::from_secs(60);
 const MAX_TOKEN: usize = 16 * 1024;
@@ -39,13 +41,26 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The claim a binding must include: an id that a deleted and recreated repository, project or
-    /// service connection with the same name doesn't inherit.
+    /// The claim a binding must include. For GitHub and GitLab an id that a deleted and recreated
+    /// repository or project with the same name doesn't inherit; for Azure DevOps the service
+    /// connection's subject (`sc://org/project/name`), which is a name: use a connection made for
+    /// this server alone.
     pub fn required_claim(self) -> &'static str {
         match self {
             Kind::Github => "repository_id",
             Kind::Gitlab => "project_id",
             Kind::Azure => "sub",
+        }
+    }
+
+    /// Claims of which a binding must include one, so that not every branch of a repository can
+    /// trigger: a branch, an environment or a workflow (GitHub), a branch or protected refs only
+    /// (GitLab).
+    pub fn narrowing_claims(self) -> &'static [&'static str] {
+        match self {
+            Kind::Github => &["ref", "environment", "job_workflow_ref"],
+            Kind::Gitlab => &["ref", "ref_protected", "environment"],
+            Kind::Azure => &[],
         }
     }
 }
@@ -137,6 +152,14 @@ pub fn check_bindings(bindings: &[Binding], issuers: &[Issuer]) -> Result<(), St
                  repository or project with the same name doesn't inherit"
             ));
         }
+        let narrow = i.kind.narrowing_claims();
+        if !narrow.is_empty() && !narrow.iter().any(|c| b.claims.contains_key(*c)) {
+            return Err(format!(
+                "oidc: a binding for {issuer} must also include one of {}, or every branch of the \
+                 repository could trigger scans",
+                narrow.join(", ")
+            ));
+        }
         for (k, v) in &b.claims {
             if k.is_empty() || k.len() > MAX_CLAIM || v.is_empty() || v.len() > MAX_CLAIM {
                 return Err(format!("oidc: claim names and values must be 1-{MAX_CLAIM} characters"));
@@ -152,7 +175,8 @@ pub fn check_bindings(bindings: &[Binding], issuers: &[Issuer]) -> Result<(), St
 /// A verified token: who it is, for the audit log and the rate limits.
 #[derive(Debug, Clone)]
 pub struct Identity {
-    /// Stable for one pipeline identity: the issuer and the subject.
+    /// The target and the binding that matched: rate limits and idempotency keys count per
+    /// binding, not per subject (which changes with every branch).
     pub owner: String,
     /// For the audit log: issuer, subject, repository or project, and run or pipeline id.
     pub actor: String,
@@ -207,7 +231,7 @@ impl Verifier {
     }
 
     /// Verifies `token` for a target with `bindings`, at `now` (Unix seconds).
-    pub async fn verify(&self, token: &str, bindings: &[Binding], now: i64) -> Result<Identity, Refused> {
+    pub async fn verify(&self, target: &str, token: &str, bindings: &[Binding], now: i64) -> Result<Identity, Refused> {
         if token.len() > MAX_TOKEN {
             return Err(refuse("the token is too long"));
         }
@@ -254,33 +278,36 @@ impl Verifier {
             return Err(refuse(format!("the token is for another audience, not {audience}")));
         }
         let exp = claims["exp"].as_i64().ok_or_else(|| refuse("no exp"))?;
-        if exp + LEEWAY_SECS <= now {
+        if exp.saturating_add(LEEWAY_SECS) <= now {
             return Err(refuse("the token expired"));
         }
         if let Some(nbf) = claims["nbf"].as_i64()
-            && nbf - LEEWAY_SECS > now
+            && nbf.saturating_sub(LEEWAY_SECS) > now
         {
             return Err(refuse("the token isn't valid yet"));
         }
         let matched = bindings
             .iter()
             .filter(|b| b.issuer.trim_end_matches('/') == iss)
-            .any(|b| b.claims.iter().all(|(k, v)| claim_eq(&claims[k.as_str()], v)));
-        if !matched {
+            .find(|b| b.claims.iter().all(|(k, v)| claim_eq(&claims[k.as_str()], v)));
+        let Some(binding) = matched else {
             return Err(refuse(format!("no binding matches ({})", describe(&claims, issuer.kind))));
-        }
-        let sub = claims["sub"].as_str().unwrap_or("");
+        };
+        let digest = crate::serve::auth::sha256(serde_json::to_string(binding).unwrap_or_default().as_bytes());
+        let fingerprint: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
         Ok(Identity {
-            owner: format!("oidc:{iss}|{sub}"),
+            owner: format!("oidc:{target}:{fingerprint}"),
             actor: format!("oidc {iss} {}", describe(&claims, issuer.kind)),
         })
     }
 
     /// The key `kid` of `issuer`, fetching the JWKS when it is stale or doesn't have it.
+    ///
+    /// Keys past their TTL are still used, up to [`JWKS_STALE`], while a refetch is in flight or
+    /// after it failed: an issuer's blip or a slow fetch must not refuse every pipeline at once.
     async fn key(&self, issuer: &Issuer, kid: &str) -> Result<(Key, Option<String>), Refused> {
-        let lookup = |keys: &Keys| -> Option<(Key, Option<String>)> {
-            let fresh = keys.fetched.is_some_and(|t| t.elapsed() < JWKS_TTL);
-            if !fresh {
+        let lookup = |keys: &Keys, max_age: Duration| -> Option<(Key, Option<String>)> {
+            if !keys.fetched.is_some_and(|t| t.elapsed() < max_age) {
                 return None;
             }
             if kid.is_empty() && keys.by_kid.len() == 1 {
@@ -288,27 +315,32 @@ impl Verifier {
             }
             keys.by_kid.get(kid).cloned()
         };
-        {
+        let stale = {
             let mut map = self.keys.lock().unwrap_or_else(|e| e.into_inner());
             let entry = map.entry(issuer.issuer.clone()).or_default();
-            if let Some(k) = lookup(entry) {
+            if let Some(k) = lookup(entry, JWKS_TTL) {
                 return Ok(k);
             }
+            let stale = lookup(entry, JWKS_STALE);
             if entry.attempted.is_some_and(|t| t.elapsed() < JWKS_REFETCH) {
-                return Err(refuse(format!("no key {kid:?} for {} (fetched recently)", issuer.issuer)));
+                return stale.ok_or_else(|| refuse(format!("no key {kid:?} for {} (fetched recently)", issuer.issuer)));
             }
             entry.attempted = Some(Instant::now());
-        }
+            stale
+        };
         let url = issuer.jwks.clone();
-        let fetched = tokio::task::spawn_blocking(move || fetch_jwks(&url))
-            .await
-            .map_err(|e| refuse(format!("JWKS fetch: {e}")))?
-            .map_err(|e| refuse(format!("JWKS {}: {e}", issuer.jwks)))?;
+        let fetched = match tokio::task::spawn_blocking(move || fetch_jwks(&url)).await {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
+                return stale.ok_or_else(|| refuse(format!("JWKS {}: {e}", issuer.jwks)));
+            }
+            Err(e) => return stale.ok_or_else(|| refuse(format!("JWKS fetch: {e}"))),
+        };
         let mut map = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.entry(issuer.issuer.clone()).or_default();
         entry.by_kid = fetched;
         entry.fetched = Some(Instant::now());
-        lookup(entry).ok_or_else(|| refuse(format!("no key {kid:?} in the JWKS of {}", issuer.issuer)))
+        lookup(entry, JWKS_TTL).ok_or_else(|| refuse(format!("no key {kid:?} in the JWKS of {}", issuer.issuer)))
     }
 }
 
@@ -454,11 +486,15 @@ mod tests {
         let (v, sign) = setup(Kind::Github, GITHUB_ISSUER);
         let es = json!({"alg": "ES256", "kid": "k1", "typ": "JWT"});
         let b = [binding(GITHUB_ISSUER, &[("repository_id", "123456"), ("ref", "refs/heads/main")])];
-        let ok = run(v.verify(&sign(es.clone(), github_claims(now)), &b, now)).unwrap();
-        assert_eq!(ok.owner, "oidc:https://token.actions.githubusercontent.com|repo:acme/shop:ref:refs/heads/main");
+        let ok = run(v.verify("shop", &sign(es.clone(), github_claims(now)), &b, now)).unwrap();
+        assert!(ok.owner.starts_with("oidc:shop:"), "{}", ok.owner);
+        // Another branch matching another binding counts separately; the same binding the same.
+        let again = run(v.verify("shop", &sign(es.clone(), github_claims(now)), &b, now)).unwrap();
+        assert_eq!(again.owner, ok.owner);
         assert!(ok.actor.contains("repository_id=123456"));
 
-        let refused = |claims: Value, header: &Value| run(v.verify(&sign(header.clone(), claims), &b, now)).is_err();
+        let refused =
+            |claims: Value, header: &Value| run(v.verify("shop", &sign(header.clone(), claims), &b, now)).is_err();
         let mut c = github_claims(now);
         c["repository_id"] = json!("999");
         assert!(refused(c, &es), "another repository");
@@ -481,7 +517,7 @@ mod tests {
         assert!(refused(github_claims(now), &json!({"alg": "HS256", "kid": "k1"})), "HMAC");
         assert!(refused(github_claims(now), &json!({"alg": "RS256", "kid": "k1"})), "key type mismatch");
         assert!(refused(github_claims(now), &json!({"alg": "ES256", "kid": "k1", "crit": ["x"]})), "crit");
-        assert!(run(v.verify(&sign(es.clone(), github_claims(now)), &[], now)).is_err(), "no bindings");
+        assert!(run(v.verify("shop", &sign(es.clone(), github_claims(now)), &[], now)).is_err(), "no bindings");
 
         // A tampered payload under the old signature.
         let token = sign(es.clone(), github_claims(now));
@@ -489,13 +525,13 @@ mod tests {
         c["repository_id"] = json!("999");
         let parts: Vec<&str> = token.split('.').collect();
         let forged = format!("{}.{}.{}", parts[0], URL_SAFE_NO_PAD.encode(c.to_string()), parts[2]);
-        assert!(run(v.verify(&forged, &[binding(GITHUB_ISSUER, &[("repository_id", "999")])], now)).is_err());
+        assert!(run(v.verify("shop", &forged, &[binding(GITHUB_ISSUER, &[("repository_id", "999")])], now)).is_err());
 
         // Numbers in claims match their text; arrays of audiences work.
         let mut c = github_claims(now);
         c["repository_id"] = json!(123456);
         c["aud"] = json!(["x", "https://scan.corp.test/"]);
-        assert!(run(v.verify(&sign(es, c), &b, now)).is_ok());
+        assert!(run(v.verify("shop", &sign(es, c), &b, now)).is_ok());
     }
 
     #[test]
@@ -507,9 +543,9 @@ mod tests {
         c["project_id"] = json!("5");
         let token = sign(json!({"alg": "ES256", "kid": "k1"}), c);
         let other = [binding(GITHUB_ISSUER, &[("repository_id", "123456")])];
-        assert!(run(v.verify(&token, &other, now)).is_err());
+        assert!(run(v.verify("shop", &token, &other, now)).is_err());
         let bound = [binding("https://gitlab.corp.test", &[("project_id", "5")])];
-        assert!(run(v.verify(&token, &bound, now)).is_ok());
+        assert!(run(v.verify("shop", &token, &bound, now)).is_ok());
     }
 
     #[test]
@@ -519,7 +555,7 @@ mod tests {
         let (v, sign) = setup(Kind::Azure, iss);
         let claims = json!({"iss": iss, "aud": AZURE_AUDIENCE, "exp": now + 300, "sub": "sc://acme/shop/scan"});
         let b = [binding(iss, &[("sub", "sc://acme/shop/scan")])];
-        assert!(run(v.verify(&sign(json!({"alg": "ES256", "kid": "k1"}), claims), &b, now)).is_ok());
+        assert!(run(v.verify("shop", &sign(json!({"alg": "ES256", "kid": "k1"}), claims), &b, now)).is_ok());
     }
 
     #[test]
@@ -532,9 +568,9 @@ mod tests {
         let v = Verifier::new(vec![issuer(Kind::Github, GITHUB_ISSUER)], Some("https://scan.corp.test".into()));
         v.keys.lock().unwrap().insert(GITHUB_ISSUER.into(), keys);
         let b = [binding(GITHUB_ISSUER, &[("repository_id", "123456")])];
-        assert!(run(v.verify(token, &b, 1_800_000_000)).is_ok());
+        assert!(run(v.verify("shop", token, &b, 1_800_000_000)).is_ok());
         let bad = format!("{}x", &token[..token.len() - 1]);
-        assert!(run(v.verify(&bad, &b, 1_800_000_000)).is_err());
+        assert!(run(v.verify("shop", &bad, &b, 1_800_000_000)).is_err());
     }
 
     #[test]
@@ -552,13 +588,50 @@ mod tests {
         assert!(Issuer::parse("jenkins=https://x").is_err());
 
         let issuers = [gh, gl];
-        assert!(check_bindings(&[binding(GITHUB_ISSUER, &[("repository_id", "1")])], &issuers).is_ok());
+        assert!(
+            check_bindings(&[binding(GITHUB_ISSUER, &[("repository_id", "1"), ("ref", "refs/heads/main")])], &issuers)
+                .is_ok()
+        );
+        assert!(
+            check_bindings(&[binding(GITHUB_ISSUER, &[("repository_id", "1"), ("environment", "dev")])], &issuers)
+                .is_ok()
+        );
+        assert!(
+            check_bindings(&[binding(GITHUB_ISSUER, &[("repository_id", "1")])], &issuers).is_err(),
+            "every branch"
+        );
         assert!(
             check_bindings(&[binding(GITHUB_ISSUER, &[("sub", "repo:a/b:ref:refs/heads/main")])], &issuers).is_err()
         );
-        assert!(check_bindings(&[binding("https://gitlab.corp.test", &[("project_id", "5")])], &issuers).is_ok());
+        assert!(
+            check_bindings(
+                &[binding("https://gitlab.corp.test", &[("project_id", "5"), ("ref_protected", "true")])],
+                &issuers
+            )
+            .is_ok()
+        );
+        assert!(check_bindings(&[binding("https://gitlab.corp.test", &[("project_id", "5")])], &issuers).is_err());
         assert!(check_bindings(&[binding("https://elsewhere.test", &[("project_id", "5")])], &issuers).is_err());
-        assert!(check_bindings(&[binding(GITHUB_ISSUER, &[("repository_id", "1"), ("aud", "x")])], &issuers).is_err());
+        assert!(
+            check_bindings(&[binding(GITHUB_ISSUER, &[("repository_id", "1"), ("ref", "r"), ("aud", "x")])], &issuers)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_keys_still_verify_while_the_issuer_is_unreachable() {
+        let now = 1_800_000_000;
+        let (v, sign) = setup(Kind::Github, GITHUB_ISSUER);
+        // Past the TTL, and the JWKS URL (port 1) refuses connections.
+        v.keys.lock().unwrap().get_mut(GITHUB_ISSUER).unwrap().fetched = Some(Instant::now() - JWKS_TTL * 2);
+        let b = [binding(GITHUB_ISSUER, &[("repository_id", "123456"), ("ref", "refs/heads/main")])];
+        let token = sign(json!({"alg": "ES256", "kid": "k1"}), github_claims(now));
+        assert!(run(v.verify("shop", &token, &b, now)).is_ok(), "the refetch failed: stale keys");
+        assert!(run(v.verify("shop", &token, &b, now)).is_ok(), "refetch throttled: stale keys");
+        let unknown = sign(json!({"alg": "ES256", "kid": "k2"}), github_claims(now));
+        assert!(run(v.verify("shop", &unknown, &b, now)).is_err());
+        v.keys.lock().unwrap().get_mut(GITHUB_ISSUER).unwrap().fetched = Some(Instant::now() - JWKS_STALE * 2);
+        assert!(run(v.verify("shop", &token, &b, now)).is_err(), "too old");
     }
 
     #[test]

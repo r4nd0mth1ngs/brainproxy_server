@@ -93,7 +93,16 @@ pub fn fingerprint(policy: &Policy) -> Option<String> {
 const RISKS: [&str; 4] = ["info", "low", "medium", "high"];
 
 fn risk_rank(r: &str) -> Option<usize> {
+    if r.eq_ignore_ascii_case("informational") {
+        return Some(0);
+    }
     RISKS.iter().position(|x| x.eq_ignore_ascii_case(r))
+}
+
+/// A finding's risk; one that can't be read counts as high, as the CLI's own gate does, so that a
+/// gate can't miss it.
+fn finding_rank(f: &Value) -> usize {
+    f["risk"].as_str().and_then(risk_rank).unwrap_or(RISKS.len() - 1)
 }
 
 /// What the policy says for an alert: its variant (`10020-1`) first, then its id (`10020`).
@@ -112,7 +121,7 @@ pub fn gate(compare: &Value, fail_on: Option<&str>, new_only: bool, policy: &Pol
     let mut count = 0;
     for f in lists.into_iter().filter_map(Value::as_array).flatten() {
         let alert_ref = f["alert_ref"].as_str().unwrap_or("");
-        let by_risk = threshold.is_some_and(|t| f["risk"].as_str().and_then(risk_rank).is_some_and(|r| r >= t));
+        let by_risk = threshold.is_some_and(|t| finding_rank(f) >= t);
         let label = || {
             format!(
                 "{alert_ref} {} ({}) {}",
@@ -139,7 +148,15 @@ pub fn gate(compare: &Value, fail_on: Option<&str>, new_only: bool, policy: &Pol
             None => {}
         }
     }
-    Gate { fail_on: fail_on.unwrap_or("").to_string(), new_only, passed: count == 0, count, policy: Some(result) }
+    // Lists cut short can't pass: what was cut off would count as unchanged from then on.
+    let truncated = compare["summary"]["truncated"] == true;
+    Gate {
+        fail_on: fail_on.unwrap_or("").to_string(),
+        new_only,
+        passed: count == 0 && !truncated,
+        count,
+        policy: Some(result),
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +205,11 @@ mod tests {
 
         let p = parse("40018\tIGNORE\n").unwrap();
         assert!(gate(&cmp, Some("high"), true, &p).passed);
+        // Risks it can't read count as high; "informational" is info; cut-off lists never pass.
+        assert!(!gate(&json!({"new": [finding("1", "critical")]}), Some("high"), false, &p).passed);
+        assert!(!gate(&json!({"new": [finding("1", "Informational")]}), Some("info"), false, &p).passed);
+        let cut = json!({"new": [], "summary": {"truncated": true}});
+        assert!(!gate(&cut, Some("high"), false, &p).passed);
         // The variant wins over the id.
         let p = parse("10020\tFAIL\n10020-1\tIGNORE\n").unwrap();
         assert!(gate(&json!({"new": [finding("10020-1", "medium")]}), None, false, &p).passed);

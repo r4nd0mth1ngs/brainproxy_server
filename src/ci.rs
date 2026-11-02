@@ -442,7 +442,7 @@ impl Ci {
                         if s["truncated"] == true {
                             self.run
                                 .reasons
-                                .push("compare: the finding lists were cut off; the policy gate is incomplete".into());
+                                .push("compare: the finding lists were cut off; so the policy gate fails".into());
                         }
                         let gate = policy::gate(d, self.args.fail_on.as_deref(), self.args.new_only, &self.args.policy);
                         if let Some(p) = &gate.policy {

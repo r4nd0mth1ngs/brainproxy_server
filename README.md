@@ -151,9 +151,12 @@ lists, and no profile stores a password in the file.
   audience tokens must be minted for. A target binds claims, which must all match exactly:
   `"oidc": [{"issuer": "https://token.actions.githubusercontent.com", "claims": {"repository_id":
   "123456", "ref": "refs/heads/main"}}]`. A GitHub binding must name `repository_id`, a GitLab one
-  `project_id` (ids a recreated repository with the same name doesn't inherit), an Azure DevOps one
-  `sub` (the service connection; its audience is fixed, so any receiver of that connection's tokens
-  accepts them). RS256 and ES256 only; keys are cached for 10 minutes. A bound token may trigger,
+  `project_id` (ids a recreated repository with the same name doesn't inherit), plus one of `ref`,
+  `environment` or `job_workflow_ref` (GitHub) or `ref`, `ref_protected` or `environment` (GitLab),
+  so that not every branch can trigger. An Azure DevOps binding names `sub`, the service
+  connection, which is a name: give the server a connection of its own (the audience is fixed, so
+  any receiver of that connection's tokens accepts them). Rate limits and idempotency keys count
+  per binding. RS256 and ES256 only; keys are cached for 10 minutes. A bound token may trigger,
   read and cancel on that target, like a trigger token; `remote --oidc github` fetches GitHub's
   token itself, and GitLab's `id_tokens` go in through `--token-env`.
 - **Alert policy**: `"policy": {"10020": "ignore", "10038-1": "warn", "40012": "fail"}`, per rule

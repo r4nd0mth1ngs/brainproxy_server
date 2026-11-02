@@ -8,7 +8,8 @@
 #
 # Or, with no stored secret: if the server runs with --oidc-issuer github and the target binds
 # this repository's id (PATCH /v1/targets/<id> {"oidc": [{"issuer":
-# "https://token.actions.githubusercontent.com", "claims": {"repository_id": "<id>"}}]}; the id is
+# "https://token.actions.githubusercontent.com", "claims": {"repository_id": "<id>",
+# "ref": "refs/heads/main"}}]}, or "environment" instead of "ref"; the id is
 # in `gh api repos/OWNER/REPO --jq .id`), add `id-token: write` to the permissions, drop
 # BRAINPROXY_TOKEN and pass `--oidc github` to remote run.
 #

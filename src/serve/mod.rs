@@ -75,20 +75,41 @@ pub struct TargetPatch {
 /// GETs a small text file over HTTP(S): no redirects, 10 s, 4 KB. Certificates aren't checked:
 /// dev instances often have self-signed ones, nothing secret is sent, and the ownership check
 /// guards against typos, not attackers.
-fn fetch_small(url: &str) -> Result<String, String> {
+/// It connects only to `addrs`, never through a proxy.
+fn fetch_small(url: &str, addrs: Vec<SocketAddr>) -> Result<String, String> {
     let tls = ureq::tls::TlsConfig::builder().disable_verification(true).build();
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .max_redirects(0)
         .http_status_as_error(false)
+        .proxy(None)
         .tls_config(tls)
-        .build()
-        .into();
+        .build();
+    let agent = ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::new(), Pinned(addrs));
     let mut resp = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?;
     if resp.status() != 200 {
         return Err(format!("{url}: HTTP {}", resp.status()));
     }
     resp.body_mut().with_config().limit(4096).read_to_string().map_err(|e| format!("{url}: {e}"))
+}
+
+/// A resolver that answers every name with the addresses it was given.
+#[derive(Debug)]
+struct Pinned(Vec<SocketAddr>);
+
+impl ureq::unversioned::resolver::Resolver for Pinned {
+    fn resolve(
+        &self,
+        _uri: &axum::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let mut out = self.empty();
+        for a in self.0.iter().take(16) {
+            out.push(*a);
+        }
+        if out.is_empty() { Err(ureq::Error::HostNotFound) } else { Ok(out) }
+    }
 }
 
 /// How long an `Idempotency-Key` answers a repeated trigger with its run.
@@ -465,11 +486,12 @@ impl Server {
         let project = self.target_dir(&t.id).join("project.bpdb");
         let cli = self.cli(project.clone(), env.clone());
         // DNS can change after registration: the base host must still resolve to allowed addresses.
-        if let Err((c, e)) = self.check_host(&cli, t).await {
-            return End::failed(c, e);
-        }
+        let addrs = match self.check_host(&cli, t).await {
+            Ok(a) => a,
+            Err((c, e)) => return End::failed(c, e),
+        };
         if t.ownership
-            && let Err(e) = self.check_ownership(t).await
+            && let Err(e) = self.check_ownership(t, addrs).await
         {
             return End::failed(code::OUT_OF_SCOPE, format!("ownership check: {e}"));
         }
@@ -535,7 +557,9 @@ impl Server {
     /// `engagement check` of the base URL's host and every other host name in the scope: allowed,
     /// and not resolving to this machine or a link-local address (a registered name pointed at the
     /// server itself would reach its admin port).
-    async fn check_host(&self, cli: &Cli, t: &TargetConfig) -> Result<(), (i32, String)> {
+    /// Checks every scope host's resolved addresses; returns the base URL host's, as the CLI
+    /// resolves it (host overrides included).
+    async fn check_host(&self, cli: &Cli, t: &TargetConfig) -> Result<Vec<std::net::IpAddr>, (i32, String)> {
         let (host, port) = target::url_host_port(&t.base_url).map_err(|e| (code::USAGE, e))?;
         let base = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
         let mut names = vec![(base, true)];
@@ -544,6 +568,7 @@ impl Server {
                 names.push((format!("{name}:{}", port.unwrap_or(443)), false));
             }
         }
+        let mut base_addrs = Vec::new();
         for (name, must_be_allowed) in names {
             let out = cli
                 .run(["engagement", "check", &name])
@@ -563,9 +588,12 @@ impl Server {
                 if let Err(e) = target::check_ip(ip, self.cfg.allow_loopback_targets) {
                     return Err((code::OUT_OF_SCOPE, format!("{name} resolves to {ip}: {e}")));
                 }
+                if must_be_allowed {
+                    base_addrs.push(ip);
+                }
             }
         }
-        Ok(())
+        Ok(base_addrs)
     }
 
     /// `project save` into `snapshots/<run>.bpdb`, keeping the newest `keep_snapshots`.
@@ -677,14 +705,21 @@ impl Server {
     }
 
     /// Fetches `/.well-known/brainproxy-<id>.txt` from the target's origin and looks for its token.
-    async fn check_ownership(&self, t: &TargetConfig) -> Result<(), String> {
+    /// It connects only to `addrs`, the addresses `check_host` just vetted, so a name resolving
+    /// elsewhere a moment later can't send the request anywhere else.
+    async fn check_ownership(&self, t: &TargetConfig, addrs: Vec<std::net::IpAddr>) -> Result<(), String> {
         let Some(token) = t.ownership_token.clone() else { return Err("ownership is on but has no token".into()) };
         let (host, port) = target::url_host_port(&t.base_url)?;
         let scheme = if t.base_url.starts_with("https://") { "https" } else { "http" };
         let host = if host.contains(':') { format!("[{host}]") } else { host };
         let url = format!("{scheme}://{host}:{port}/.well-known/brainproxy-{}.txt", t.id);
         let shown = url.clone();
-        let body = tokio::task::spawn_blocking(move || fetch_small(&url)).await.map_err(|e| e.to_string())??;
+        if addrs.is_empty() {
+            return Err(format!("{} resolved to no addresses", t.base_url));
+        }
+        let pinned: Vec<SocketAddr> = addrs.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+        let body =
+            tokio::task::spawn_blocking(move || fetch_small(&url, pinned)).await.map_err(|e| e.to_string())??;
         if body.lines().any(|l| l.trim() == token) {
             Ok(())
         } else {
@@ -717,7 +752,7 @@ impl Server {
         {
             cli_ok(&cli, &a.argv()).await?;
         }
-        self.check_host(&cli, t).await.map_err(|(c, e)| {
+        self.check_host(&cli, t).await.map(drop).map_err(|(c, e)| {
             ApiError::invalid(format!("base_url {}: {e}", t.base_url)).with_kind(if c == code::OUT_OF_SCOPE {
                 "out_of_scope"
             } else {

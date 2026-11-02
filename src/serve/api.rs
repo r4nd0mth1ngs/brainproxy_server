@@ -217,7 +217,7 @@ async fn authenticate(
     let found = s.db().target(target).map_err(ApiError::db)?;
     let bindings = found.map(|t| t.config.oidc).unwrap_or_default();
     let now = time::now_millis() / 1000;
-    let identity = match s.oidc.verify(jwt, &bindings, now).await {
+    let identity = match s.oidc.verify(target, jwt, &bindings, now).await {
         Ok(i) => i,
         Err(oidc::Refused(why)) => return Err(refuse_auth(app, ip, None, Some(target), &format!("OIDC: {why}"))),
     };

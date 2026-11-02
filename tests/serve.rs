@@ -913,6 +913,7 @@ fn oidc_tokens_trigger_and_read_only_the_targets_that_bind_them() {
     // Bindings must name the immutable project id, and an issuer the server trusts.
     for bad in [
         json!([{"issuer": iss, "claims": {"ref": "main"}}]),
+        json!([{"issuer": iss, "claims": {"project_id": "5"}}]),
         json!([{"issuer": "https://gitlab.elsewhere.test", "claims": {"project_id": "5"}}]),
     ] {
         let body = json!({"id": "bad", "base_url": app.url(), "scope": [app.host()], "oidc": bad});
