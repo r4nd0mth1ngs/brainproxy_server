@@ -17,6 +17,7 @@ pub mod auth;
 pub mod db;
 pub mod oidc;
 pub mod target;
+pub mod ui;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;

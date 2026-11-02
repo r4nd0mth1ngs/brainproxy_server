@@ -187,11 +187,17 @@ change with a new registration.
 | `GET .../runs/{r}/report.{json,html,sarif}` | token | Reports of what this run found |
 | `GET /v1/targets/{t}/latest` | token | The last completed run |
 | `GET /v1/healthz` | anyone | Liveness |
+| `GET /ui` | anyone (the page asks for a token) | A read-only results page: target, latest run, last 20 runs, drift, report downloads |
 
 Responses use the CLI's envelope: `{"ok": true, "data": ...}` or
 `{"ok": false, "error": {"kind", "message"}}`. A run's `state` is `queued`, `running`, `completed`,
 `incomplete`, `failed`, `cancelled` or `superseded`; a completed run's `outcome` is `passed` or
 `gate_failed`, and `exit_code` is what `remote` exits with.
+
+`/ui` is a small page for people: paste a token and it shows what that token may read. Give
+people `read` tokens, not the pipeline's. The page and its script hold no data and are served
+with a strict Content-Security-Policy; the token stays in the tab's session storage and is only
+sent as an `Authorization` header (downloads too), never in a URL.
 
 [`deploy/compose/`](deploy/compose/) runs it with Caddy for TLS (the reference deployment; the same
 on EC2, an Azure VM or your own servers), built from [`docker/server.Dockerfile`](docker/server.Dockerfile).

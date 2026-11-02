@@ -126,7 +126,8 @@ pub fn admin_router(server: Arc<Server>) -> Router {
 }
 
 fn common(r: Router<App>) -> Router<App> {
-    r.route("/v1/healthz", get(healthz))
+    r.merge(super::ui::routes())
+        .route("/v1/healthz", get(healthz))
         .route("/v1/targets", get(list_targets))
         .route("/v1/targets/{t}", get(show_target))
         .route("/v1/targets/{t}/runs", post(trigger).get(list_runs))

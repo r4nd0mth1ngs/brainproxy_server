@@ -302,6 +302,29 @@ fn tokens_are_bound_to_their_target_and_admin_is_only_on_its_listener() {
 }
 
 #[test]
+fn the_results_page_needs_no_token_and_locks_itself_down() {
+    let Some((_dir, s)) = setup(&[]) else { return };
+    for port in [s.public, s.admin] {
+        for (path, ty) in [("/ui", "text/html"), ("/ui/app.js", "text/javascript"), ("/ui/app.css", "text/css")] {
+            let resp = s.agent.get(&format!("http://127.0.0.1:{port}{path}")).call().unwrap();
+            assert_eq!(resp.status().as_u16(), 200, "{path}");
+            let h = resp.headers();
+            assert!(h["content-type"].to_str().unwrap().starts_with(ty), "{path}: {h:?}");
+            let csp = h["content-security-policy"].to_str().unwrap();
+            assert!(
+                csp.starts_with("default-src 'none'; script-src 'self';") && csp.contains("frame-ancestors 'none'")
+            );
+            assert_eq!(h["x-content-type-options"], "nosniff");
+            assert_eq!(h["referrer-policy"], "no-referrer");
+            assert_eq!(h["cache-control"], "no-store");
+        }
+    }
+    // The page holds no data: the API behind it still wants a token.
+    assert_eq!(s.get_public("/v1/targets", None).0, 401);
+    assert_eq!(s.get_public("/ui/other.js", None).0, 404);
+}
+
+#[test]
 fn at_most_ten_targets() {
     let Some((dir, s)) = setup(&[]) else { return };
     let app = App::start(0);

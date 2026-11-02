@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Scan results</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header>
+  <h1>Scan results</h1>
+  <form id="token-form" autocomplete="off">
+    <label for="token">Token</label>
+    <input id="token" type="password" spellcheck="false" placeholder="bpt_..." required>
+    <button type="submit">Show</button>
+    <button type="button" id="forget">Forget token</button>
+  </form>
+  <p class="hint">Use a read-only token. It stays in this tab (session storage) and is sent only to this server.</p>
+</header>
+<main>
+  <p id="message" role="alert" hidden></p>
+  <div id="picker" hidden>
+    <label for="target">Target</label>
+    <select id="target"></select>
+    <button type="button" id="refresh">Refresh</button>
+    <span id="status" class="muted"></span>
+  </div>
+  <section id="summary" hidden><h2>Target</h2><div class="body"></div></section>
+  <section id="latest" hidden><h2>Latest completed run</h2><div class="body"></div></section>
+  <section id="runs" hidden><h2>Last 20 runs</h2><div class="body"></div></section>
+  <section id="run" hidden><h2>Run</h2><div class="body"></div></section>
+</main>
+<script src="/ui/app.js"></script>
+</body>
+</html>
