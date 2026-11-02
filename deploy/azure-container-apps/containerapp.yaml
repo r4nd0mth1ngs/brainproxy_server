@@ -1,0 +1,110 @@
+# brainproxy-server on Azure Container Apps: one replica, /work on replica storage, state in Azure
+# Blob Storage (--store). See README.md here. Replace SUB, RG, the names and the image.
+#
+#   az containerapp create -g RG -n brainproxy-server --yaml containerapp.yaml
+location: westeurope
+name: brainproxy-server
+type: Microsoft.App/containerApps
+identity:
+  # One user-assigned identity for the image pull, the Key Vault secrets and the storage account.
+  type: UserAssigned
+  userAssignedIdentities:
+    /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.ManagedIdentity/userAssignedIdentities/brainproxy-server: {}
+properties:
+  managedEnvironmentId: /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.App/managedEnvironments/brainproxy
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      # The public API only, over HTTPS (Container Apps terminates TLS). The admin API listens on
+      # 127.0.0.1 in the replica and is never exposed: use `az containerapp exec`.
+      external: true
+      targetPort: 9090
+      transport: http
+      allowInsecure: false
+      # Optional: only your CI runners' addresses.
+      # ipSecurityRestrictions:
+      #   - name: ci
+      #     action: Allow
+      #     ipAddressRange: 198.51.100.0/24
+    registries:
+      - server: myregistry.azurecr.io
+        identity: /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.ManagedIdentity/userAssignedIdentities/brainproxy-server
+    secrets:
+      - name: admin-token
+        keyVaultUrl: https://my-vault.vault.azure.net/secrets/brainproxy-admin-token
+        identity: /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.ManagedIdentity/userAssignedIdentities/brainproxy-server
+      - name: shop-dev-app-password
+        keyVaultUrl: https://my-vault.vault.azure.net/secrets/brainproxy-shop-dev-app-password
+        identity: /subscriptions/SUB/resourceGroups/RG/providers/Microsoft.ManagedIdentity/userAssignedIdentities/brainproxy-server
+  template:
+    # Never more than one replica: control.db (SQLite) and the project files belong to one server.
+    scale:
+      minReplicas: 1
+      maxReplicas: 1
+    terminationGracePeriodSeconds: 60
+    containers:
+      - name: brainproxy-server
+        # Built from docker/server.Dockerfile with --build-arg CARGO_FEATURES=object-store.
+        image: myregistry.azurecr.io/brainproxy-server:TAG
+        args:
+          - serve
+          - --listen=0.0.0.0:9090
+          - --admin-listen=127.0.0.1:9091
+          - --admin-token-file=/run/brainproxy-admin/token
+          # Container Apps' ingress sets X-Forwarded-For.
+          - --trust-forwarded
+        env:
+          - name: BRAINPROXY_SERVER_STORE
+            value: az://brainproxy/server
+          - name: AZURE_STORAGE_ACCOUNT_NAME
+            value: mybrainproxystorage
+          # The user-assigned identity's client id, for the storage account (Storage Blob Data
+          # Contributor on the container).
+          - name: AZURE_CLIENT_ID
+            value: 00000000-0000-0000-0000-000000000000
+          # Target secrets: the variable a target's secret_env names (README.md, "Secrets").
+          - name: SHOP_DEV_APP_PASSWORD
+            secretRef: shop-dev-app-password
+        resources:
+          cpu: 2.0
+          memory: 4Gi
+        probes:
+          # Restoring from the store happens before the listeners start: up to 5 minutes here
+          # (Container Apps allows at most 10 failures).
+          - type: Startup
+            httpGet:
+              path: /v1/healthz
+              port: 9090
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 10
+          - type: Readiness
+            httpGet:
+              path: /v1/healthz
+              port: 9090
+            periodSeconds: 10
+          - type: Liveness
+            httpGet:
+              path: /v1/healthz
+              port: 9090
+            periodSeconds: 30
+            failureThreshold: 3
+        volumeMounts:
+          - volumeName: work
+            mountPath: /work
+          - volumeName: tmp
+            mountPath: /tmp
+          - volumeName: admin-token
+            mountPath: /run/brainproxy-admin
+    volumes:
+      # Replica storage, gone when the replica is. Not Azure Files: the server refuses SMB.
+      - name: work
+        storageType: EmptyDir
+      - name: tmp
+        storageType: EmptyDir
+      # The admin token as the file /run/brainproxy-admin/token.
+      - name: admin-token
+        storageType: Secret
+        secrets:
+          - secretRef: admin-token
+            path: token
