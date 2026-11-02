@@ -174,6 +174,7 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     };
     let mut first_sync = false;
     if let Some(s) = &store {
+        s.acquire(store::LEASE_WAIT).await?;
         match store::restore(s, &cfg.work).await? {
             Some(n) => eprintln!("brainproxy-server: restored control.db and {n} target(s) from {}", s.url),
             None => first_sync = !s.has("control.db").await?,
@@ -275,6 +276,9 @@ pub async fn run(cfg: Config) -> Result<(), String> {
     .await;
     if let Some(sync) = server.sync.get() {
         sync.flush(Duration::from_secs(20)).await;
+    }
+    if let Some(s) = &server.store {
+        s.release().await;
     }
     Ok(())
 }

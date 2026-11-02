@@ -13,10 +13,19 @@
 //!
 //! Uploads happen in the background, a few seconds after a change (a run's end, an admin
 //! operation), and once more on shutdown. A failed upload is retried a minute later.
+//!
+//! `<prefix>/lease.json` keeps a second server off the store: a server takes it before restoring,
+//! renews it every minute and gives it back on shutdown. A server that finds another's lease
+//! waits for it to end (a crashed server's runs out after three minutes), and one that loses
+//! its lease stops uploading. It guards against an overlapping deployment, not against two
+//! servers started at the same instant.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use serde_json::json;
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,6 +35,11 @@ use super::Server;
 const DEBOUNCE: Duration = Duration::from_secs(5);
 /// After a failed upload, the next try.
 const RETRY: Duration = Duration::from_secs(60);
+/// How long a lease lasts without renewal, and how often it is renewed.
+const LEASE_MS: i64 = 3 * 60 * 1000;
+const RENEW: Duration = Duration::from_secs(60);
+/// How long a starting server waits for another's lease.
+pub const LEASE_WAIT: Duration = Duration::from_secs(5 * 60);
 
 /// Something to copy to the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +81,17 @@ impl Sync {
 /// Starts the sync task for `server`, whose `store` must be set.
 pub fn start(server: Arc<Server>) -> Sync {
     let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn({
+        let server = server.clone();
+        async move {
+            loop {
+                tokio::time::sleep(RENEW).await;
+                if let Some(store) = server.store.as_ref() {
+                    store.renew().await;
+                }
+            }
+        }
+    });
     tokio::spawn(worker(server, rx));
     Sync { tx }
 }
@@ -121,6 +146,14 @@ async fn worker(server: Arc<Server>, mut rx: mpsc::UnboundedReceiver<Msg>) {
                 Item::Control => 3,
             });
             let mut failed = Vec::new();
+            if !store.held.load(Ordering::SeqCst) {
+                eprintln!(
+                    "brainproxy-server: store {}: another server holds it; {} change(s) not uploaded",
+                    store.url,
+                    pending.len()
+                );
+                pending.clear();
+            }
             for item in std::mem::take(&mut pending) {
                 if let Err(e) = server.upload(store, &item).await {
                     eprintln!("brainproxy-server: store {}: {item:?}: {e}", store.url);
@@ -217,10 +250,97 @@ pub async fn restore(store: &Store, work: &Path) -> Result<Option<usize>, String
 pub struct Store {
     /// As given, for messages.
     pub url: String,
+    /// This server's name in the lease, and whether it holds the lease.
+    holder: String,
+    held: AtomicBool,
     #[cfg(feature = "object-store")]
     os: Arc<dyn object_store::ObjectStore>,
     #[cfg(feature = "object-store")]
     prefix: object_store::path::Path,
+}
+
+impl Store {
+    #[cfg(feature = "object-store")]
+    fn new_holder() -> String {
+        super::auth::base32(&super::auth::random_bytes::<10>())
+    }
+
+    /// The lease's holder and end, if there is one.
+    async fn lease(&self) -> Result<Option<(String, i64)>, String> {
+        let Some(bytes) = self.get_bytes("lease.json").await? else { return Ok(None) };
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        Ok(Some((v["holder"].as_str().unwrap_or_default().to_string(), v["until"].as_i64().unwrap_or(0))))
+    }
+
+    async fn write_lease(&self) -> Result<(), String> {
+        let host = std::env::var("HOSTNAME").unwrap_or_default();
+        let until = crate::time::now_millis() + LEASE_MS;
+        let body = json!({"holder": self.holder, "host": host, "until": until});
+        self.put_bytes("lease.json", body.to_string().into_bytes()).await
+    }
+
+    /// Takes the lease, waiting up to `wait` for another server's to end.
+    pub async fn acquire(&self, wait: Duration) -> Result<(), String> {
+        let start = std::time::Instant::now();
+        let mut said = false;
+        loop {
+            match self.lease().await? {
+                Some((holder, until)) if holder != self.holder && until > crate::time::now_millis() => {
+                    if start.elapsed() >= wait {
+                        return Err(format!(
+                            "{}: another server holds the store until {} (one server per store; stop the other first)",
+                            self.url,
+                            crate::time::format_millis(until)
+                        ));
+                    }
+                    if !said {
+                        eprintln!(
+                            "brainproxy-server: {}: another server holds the store until {}; waiting",
+                            self.url,
+                            crate::time::format_millis(until)
+                        );
+                        said = true;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                _ => {
+                    self.write_lease().await?;
+                    self.held.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Extends the lease, unless another server has taken it meanwhile.
+    async fn renew(&self) {
+        if !self.held.load(Ordering::SeqCst) {
+            return;
+        }
+        let result = match self.lease().await {
+            Ok(Some((holder, _))) if holder != self.holder => {
+                self.held.store(false, Ordering::SeqCst);
+                eprintln!("brainproxy-server: {}: another server took the store; this one stops uploading", self.url);
+                return;
+            }
+            Ok(_) => self.write_lease().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            eprintln!("brainproxy-server: {}: renewing the lease: {e}", self.url);
+        }
+    }
+
+    /// Gives the lease back, on shutdown after the last upload.
+    pub async fn release(&self) {
+        if self.held.swap(false, Ordering::SeqCst)
+            && let Ok(Some((holder, _))) = self.lease().await
+            && holder == self.holder
+            && let Err(e) = self.delete_key("lease.json").await
+        {
+            eprintln!("brainproxy-server: {}: releasing the lease: {e}", self.url);
+        }
+    }
 }
 
 #[cfg(not(feature = "object-store"))]
@@ -246,6 +366,15 @@ impl Store {
     pub async fn has(&self, _key: &str) -> Result<bool, String> {
         unreachable!("no Store without the object-store feature")
     }
+    async fn get_bytes(&self, _key: &str) -> Result<Option<Vec<u8>>, String> {
+        unreachable!("no Store without the object-store feature")
+    }
+    async fn put_bytes(&self, _key: &str, _bytes: Vec<u8>) -> Result<(), String> {
+        unreachable!("no Store without the object-store feature")
+    }
+    async fn delete_key(&self, _key: &str) -> Result<(), String> {
+        unreachable!("no Store without the object-store feature")
+    }
 }
 
 #[cfg(feature = "object-store")]
@@ -262,9 +391,17 @@ impl Store {
             let dir = Path::new(parsed.path());
             std::fs::create_dir_all(dir).map_err(|e| format!("--store {url}: {e}"))?;
         }
-        let options = std::env::vars().filter(|(k, _)| k.starts_with("AWS_") || k.starts_with("AZURE_"));
+        // IDENTITY_ENDPOINT: managed identity on Azure Container Apps and App Service.
+        let options = std::env::vars()
+            .filter(|(k, _)| k.starts_with("AWS_") || k.starts_with("AZURE_") || k == "IDENTITY_ENDPOINT");
         let (os, prefix) = object_store::parse_url_opts(&parsed, options).map_err(|e| format!("--store {url}: {e}"))?;
-        Ok(Store { url: url.to_string(), os: Arc::from(os), prefix })
+        Ok(Store {
+            url: url.to_string(),
+            holder: Store::new_holder(),
+            held: AtomicBool::new(false),
+            os: Arc::from(os),
+            prefix,
+        })
     }
 
     fn key(&self, key: &str) -> object_store::path::Path {
@@ -352,6 +489,25 @@ impl Store {
         Ok(())
     }
 
+    async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>, String> {
+        use object_store::ObjectStoreExt;
+        match self.os.get(&self.key(key)).await {
+            Ok(g) => Ok(Some(g.bytes().await.map_err(|e| format!("{}: {key}: {e}", self.url))?.to_vec())),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(e) => Err(format!("{}: {key}: {e}", self.url)),
+        }
+    }
+
+    async fn put_bytes(&self, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+        use object_store::ObjectStoreExt;
+        self.os.put(&self.key(key), bytes.into()).await.map(drop).map_err(|e| format!("{}: {key}: {e}", self.url))
+    }
+
+    async fn delete_key(&self, key: &str) -> Result<(), String> {
+        use object_store::ObjectStoreExt;
+        self.os.delete(&self.key(key)).await.map_err(|e| format!("{}: {key}: {e}", self.url))
+    }
+
     pub async fn has(&self, key: &str) -> Result<bool, String> {
         use object_store::ObjectStoreExt;
         match self.os.head(&self.key(key)).await {
@@ -403,6 +559,23 @@ mod tests {
             left.extend(d.flatten().map(|e| e.path()));
         }
         assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn one_server_per_store() {
+        let bucket = tempfile::tempdir().unwrap();
+        let url = format!("file://{}", bucket.path().display());
+        let (a, b) = (Store::open(&url).unwrap(), Store::open(&url).unwrap());
+        a.acquire(Duration::ZERO).await.unwrap();
+        let e = b.acquire(Duration::ZERO).await.unwrap_err();
+        assert!(e.contains("another server holds the store"), "{e}");
+        a.release().await;
+        b.acquire(Duration::ZERO).await.unwrap();
+        // A taken-over lease stops the old holder's uploads.
+        a.held.store(true, Ordering::SeqCst);
+        a.renew().await;
+        assert!(!a.held.load(Ordering::SeqCst));
+        assert!(b.held.load(Ordering::SeqCst));
     }
 
     #[test]
