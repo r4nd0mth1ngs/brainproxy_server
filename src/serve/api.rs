@@ -731,11 +731,16 @@ async fn update_target(
     let (ip, caller) = admin_only(&app, peer, &headers)?;
     let patch: TargetPatch =
         serde_json::from_slice(&body).map_err(|e| ApiError::invalid(format!("request body: {e}")))?;
-    let changed: Vec<&str> =
-        [("oidc", patch.oidc.is_some()), ("policy", patch.policy.is_some()), ("ownership", patch.ownership.is_some())]
-            .into_iter()
-            .filter_map(|(k, set)| set.then_some(k))
-            .collect();
+    let changed: Vec<&str> = [
+        ("oidc", patch.oidc.is_some()),
+        ("policy", patch.policy.is_some()),
+        ("ownership", patch.ownership.is_some()),
+        ("notify", patch.notify.is_some()),
+        ("defectdojo", patch.defectdojo.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(k, set)| set.then_some(k))
+    .collect();
     let result = app.server.update_target(&t, patch).await;
     let mut e = caller.audit(ip, "update");
     e.target = Some(t);

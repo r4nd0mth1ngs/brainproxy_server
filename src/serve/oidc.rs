@@ -114,7 +114,7 @@ impl Issuer {
 }
 
 /// https, or http to this machine (for tests and a local identity provider).
-fn secure_url(url: &str) -> bool {
+pub fn secure_url(url: &str) -> bool {
     if url.starts_with("https://") {
         return true;
     }

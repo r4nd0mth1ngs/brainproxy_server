@@ -1073,3 +1073,170 @@ fn a_fresh_work_directory_is_restored_from_the_store() {
         std::thread::sleep(Duration::from_millis(200));
     }
 }
+
+/// One request a [`Receiver`] got.
+struct Received {
+    path: String,
+    /// Header names in lower case.
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+/// A local HTTP endpoint for webhooks and the DefectDojo API: records requests, answers 201.
+struct Receiver {
+    port: u16,
+    got: std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+}
+
+impl Receiver {
+    fn start() -> Receiver {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let g = got.clone();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().flatten() {
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap_or(0);
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let mut headers = std::collections::HashMap::new();
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim_end().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.trim_end().split_once(':') {
+                        headers.insert(k.to_ascii_lowercase(), v.trim().to_string());
+                    }
+                }
+                let length = headers.get("content-length").and_then(|l| l.parse().ok()).unwrap_or(0);
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                g.lock().unwrap().push(Received { path, headers, body });
+                let _ = conn.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            }
+        });
+        Receiver { port, got }
+    }
+
+    /// Waits until `n` requests arrived.
+    fn wait_for(&self, n: usize) -> std::sync::MutexGuard<'_, Vec<Received>> {
+        let start = Instant::now();
+        loop {
+            let got = self.got.lock().unwrap();
+            if got.len() >= n {
+                return got;
+            }
+            drop(got);
+            assert!(start.elapsed() < Duration::from_secs(30), "fewer than {n} requests arrived");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[test]
+fn signed_webhooks_and_a_defectdojo_reimport_after_a_run() {
+    let Some((dir, s)) = setup(&[]) else { return };
+    let app = App::start(2);
+    app.state.drift.store(true, Ordering::SeqCst);
+    let recv = Receiver::start();
+    s.register("shop", &app, json!({"gate": {"fail_on": "high"}}));
+    let secrets = dir.path().join("secrets/shop");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(secrets.join("HOOK_URL"), format!("http://127.0.0.1:{}/hook\n", recv.port)).unwrap();
+    std::fs::write(secrets.join("HOOK_KEY"), "whsec_test_key").unwrap();
+    std::fs::write(secrets.join("DOJO_TOKEN"), "dojo-token").unwrap();
+
+    // Hooks name secrets, never URLs; a generic hook needs its key.
+    let generic_without_key = json!({"notify": [{"kind": "generic", "url_secret": "HOOK_URL"}]});
+    let bad = s.admin("PATCH", "/v1/targets/shop", Some(generic_without_key));
+    assert_eq!(bad.0, 400, "{}", bad.1);
+    let bad = s.admin("PATCH", "/v1/targets/shop", Some(json!({"notify": [{"kind": "slack", "url": "https://x"}]})));
+    assert_eq!(bad.0, 400, "{}", bad.1);
+    let (status, v) = s.admin(
+        "PATCH",
+        "/v1/targets/shop",
+        Some(json!({
+            "notify": [
+                {"kind": "generic", "url_secret": "HOOK_URL", "secret": "HOOK_KEY"},
+                // Only on a pass: this run fails its gate, so it isn't sent (and its secret isn't set).
+                {"kind": "slack", "url_secret": "SLACK_URL", "on": ["passed"]},
+            ],
+            "defectdojo": {"url": format!("http://127.0.0.1:{}/", recv.port), "token_secret": "DOJO_TOKEN",
+                           "product_name": "Shop", "engagement_name": "CI"},
+        })),
+    );
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["data"]["notify"][0]["url_secret"], "HOOK_URL");
+    assert_eq!(v["data"]["defectdojo"]["scan_type"], "SARIF");
+
+    let tok = s.token("shop", "trigger");
+    let (code, r) = remote(&s, &tok, &["run", "--target", "shop", "--commit", "c1"]);
+    assert_eq!(code, 5, "{r}");
+    let run = r["run"].as_str().unwrap();
+
+    let got = recv.wait_for(2);
+    let hook = got.iter().find(|g| g.path == "/hook").expect("the webhook");
+    let ts = &hook.headers["x-brainproxy-timestamp"];
+    let sig = hook.headers["x-brainproxy-signature"].strip_prefix("sha256=").unwrap();
+    let sig: Vec<u8> = (0..sig.len()).step_by(2).map(|i| u8::from_str_radix(&sig[i..i + 2], 16).unwrap()).collect();
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"whsec_test_key");
+    let signed = [ts.as_bytes(), b".", &hook.body].concat();
+    ring::hmac::verify(&key, &signed, &sig).expect("a valid signature");
+    assert!((unix_now() - ts.parse::<i64>().unwrap()).abs() < 300);
+    assert!(hook.headers["x-brainproxy-delivery"].starts_with("d-"));
+    let body: Value = serde_json::from_slice(&hook.body).unwrap();
+    assert_eq!(body["event"], "gate_failed");
+    assert_eq!(body["run"], run);
+    assert_eq!(body["commit"], "c1");
+    assert_eq!(body["gate"]["passed"], false);
+    assert!(body["new_findings"].as_array().unwrap().iter().any(|f| f["risk"] == "high"), "{body}");
+    assert_eq!(body["links"]["reports"]["sarif"], format!("/v1/targets/shop/runs/{run}/report.sarif"));
+
+    let dojo = got.iter().find(|g| g.path == "/api/v2/reimport-scan/").expect("the reimport");
+    assert_eq!(dojo.headers["authorization"], "Token dojo-token");
+    let boundary = dojo.headers["content-type"].strip_prefix("multipart/form-data; boundary=").unwrap();
+    let text = String::from_utf8_lossy(&dojo.body);
+    for (name, value) in [
+        ("scan_type", "SARIF"),
+        ("product_name", "Shop"),
+        ("engagement_name", "CI"),
+        ("test_title", "brainproxy shop"),
+        ("auto_create_context", "true"),
+        ("close_old_findings", "true"),
+    ] {
+        assert!(text.contains(&format!("name=\"{name}\"\r\n\r\n{value}\r\n")), "{name}: {text}");
+    }
+    assert!(text.contains("name=\"file\"; filename=\"report.sarif\""));
+    let sarif = std::fs::read_to_string(dir.path().join(format!("work/targets/shop/runs/{run}/report.sarif"))).unwrap();
+    assert!(text.contains(&sarif) && text.ends_with(&format!("--{boundary}--\r\n")));
+    assert_eq!(got.len(), 2, "the pass-only Slack hook was sent");
+    drop(got);
+
+    // Both deliveries are audited, without their URLs.
+    let start = Instant::now();
+    let audit = loop {
+        let (_, audit) = s.admin("GET", "/v1/audit?limit=100", None);
+        let lines: Vec<Value> = audit["data"]["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["action"] == "notify" || e["action"] == "defectdojo")
+            .cloned()
+            .collect();
+        if lines.len() >= 2 || start.elapsed() > Duration::from_secs(10) {
+            break lines;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(audit.len(), 2, "{audit:?}");
+    assert!(audit.iter().all(|e| e["result"] == "ok" && e["actor"] == "server"), "{audit:?}");
+    assert!(!format!("{audit:?}").contains("127.0.0.1"));
+
+    // null removes the DefectDojo settings.
+    let (status, v) = s.admin("PATCH", "/v1/targets/shop", Some(json!({"defectdojo": null})));
+    assert_eq!(status, 200, "{v}");
+    assert!(v["data"]["defectdojo"].is_null() && v["data"]["notify"].is_array(), "{v}");
+}

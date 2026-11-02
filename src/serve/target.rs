@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::oidc;
+use super::{notify, oidc};
 use crate::policy::{self, Policy};
 
 /// `[a-z0-9-]{1,32}`, not starting or ending with `-`: used in paths, file names and tokens.
@@ -166,6 +166,12 @@ pub struct TargetConfig {
     /// Made by the server when `ownership` is turned on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ownership_token: Option<String>,
+    /// Webhooks sent when a run ends (see `notify`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notify: Vec<notify::Hook>,
+    /// A DefectDojo reimport of each completed run's SARIF report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defectdojo: Option<notify::DefectDojo>,
 }
 
 fn default_preset() -> String {
@@ -279,7 +285,7 @@ impl TargetConfig {
         if self.secret_env.len() > 16 {
             return Err("at most 16 secret_env entries".into());
         }
-        Ok(())
+        notify::check(&self.notify, self.defectdojo.as_ref())
     }
 }
 

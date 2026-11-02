@@ -15,6 +15,7 @@
 pub mod api;
 pub mod auth;
 pub mod db;
+pub mod notify;
 pub mod oidc;
 pub mod store;
 pub mod target;
@@ -73,6 +74,19 @@ pub struct TargetPatch {
     pub oidc: Option<Vec<oidc::Binding>>,
     pub policy: Option<crate::policy::Policy>,
     pub ownership: Option<bool>,
+    pub notify: Option<Vec<notify::Hook>>,
+    /// `null` removes the DefectDojo settings.
+    #[serde(default, deserialize_with = "present")]
+    pub defectdojo: Option<Option<notify::DefectDojo>>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 /// GETs a small text file over HTTP(S): no redirects, 10 s, 4 KB. Certificates aren't checked:
@@ -492,6 +506,7 @@ impl Server {
             if let Err(e) = self.db().finish_run(&id, &end, time::now_millis()) {
                 eprintln!("brainproxy-server: recording the end of run {id}: {e}");
             }
+            notify::spawn(self.clone(), target.clone(), id.clone());
             self.live.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
             self.runs_changed();
             self.sync(store::Item::Run { target: target.clone(), run: id.clone() });
@@ -741,7 +756,7 @@ impl Server {
         Ok(())
     }
 
-    /// Changes a target's OIDC bindings, alert policy or ownership check. Scope, URL and project
+    /// Changes a target's OIDC bindings, alert policy, ownership check or notifications. Scope, URL and project
     /// settings don't change: those need a new registration.
     pub async fn update_target(&self, id: &str, patch: TargetPatch) -> Result<Value, ApiError> {
         let _op = self.admin_ops.lock().await;
@@ -756,7 +771,14 @@ impl Server {
         if let Some(o) = patch.ownership {
             t.ownership = o;
         }
+        if let Some(n) = patch.notify {
+            t.notify = n;
+        }
+        if let Some(d) = patch.defectdojo {
+            t.defectdojo = d;
+        }
         crate::policy::check(&t.policy).map_err(ApiError::invalid)?;
+        notify::check(&t.notify, t.defectdojo.as_ref()).map_err(ApiError::invalid)?;
         self.check_settings(&mut t, Some(&before))?;
         self.db().update_config(&t).map_err(ApiError::db)?;
         Ok(t.public_json())
