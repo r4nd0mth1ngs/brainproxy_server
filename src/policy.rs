@@ -119,7 +119,9 @@ pub fn gate(compare: &Value, fail_on: Option<&str>, new_only: bool, policy: &Pol
     }
     let mut result = PolicyResult::default();
     let mut count = 0;
-    for f in lists.into_iter().filter_map(Value::as_array).flatten() {
+    // A stateless run lists false positives too (`--state all`); they never count, as in the CLI's gate.
+    let counted = |f: &&Value| !matches!(f["state"].as_str(), Some("false_positive" | "removed"));
+    for f in lists.into_iter().filter_map(Value::as_array).flatten().filter(counted) {
         let alert_ref = f["alert_ref"].as_str().unwrap_or("");
         let by_risk = threshold.is_some_and(|t| finding_rank(f) >= t);
         let label = || {

@@ -7,6 +7,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::net::{IpAddr, SocketAddr};
+use std::path::Path;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -43,6 +44,29 @@ where
         });
     }
     Ok(out)
+}
+
+/// The target's secrets for the CLI's environment: each `secret_env` variable from the file
+/// `<secrets_dir>/<target>/<variable>`, else from this process's variable it names.
+pub fn secrets(t: &TargetConfig, secrets_dir: &Path) -> Result<Vec<(OsString, OsString)>, String> {
+    let mut env = Vec::new();
+    for (cli_var, source) in &t.secret_env {
+        let file = secrets_dir.join(&t.id).join(cli_var);
+        let value = match std::fs::read_to_string(&file) {
+            Ok(v) => OsString::from(v.trim_end_matches(['\r', '\n'])),
+            Err(_) => std::env::var_os(source).ok_or_else(|| {
+                // Where secrets come from stays in the server log, not in what read tokens see.
+                eprintln!(
+                    "brainproxy-server: secret {cli_var} of target {} isn't set: no file {} and no variable {source}",
+                    t.id,
+                    file.display()
+                );
+                format!("secret {cli_var} of target {} isn't set on the server (see its log)", t.id)
+            })?,
+        };
+        env.push((cli_var.into(), value));
+    }
+    Ok(env)
 }
 
 /// Starts the engagement for `t` in `cli`'s project (which must not exist yet): its scope entries,

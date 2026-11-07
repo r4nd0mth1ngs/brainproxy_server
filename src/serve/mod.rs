@@ -336,22 +336,7 @@ impl Server {
     /// secrets, so one target's scan never sees another's passwords (research §5.5).
     fn target_env(&self, t: &TargetConfig) -> Result<Vec<(OsString, OsString)>, String> {
         let mut env = base_env(&self.cfg);
-        for (cli_var, source) in &t.secret_env {
-            let file = self.cfg.secrets_dir.join(&t.id).join(cli_var);
-            let value = match std::fs::read_to_string(&file) {
-                Ok(v) => OsString::from(v.trim_end_matches(['\r', '\n'])),
-                Err(_) => std::env::var_os(source).ok_or_else(|| {
-                    // Where secrets come from stays in the server log, not in what read tokens see.
-                    eprintln!(
-                        "brainproxy-server: secret {cli_var} of target {} isn't set: no file {} and no variable {source}",
-                        t.id,
-                        file.display()
-                    );
-                    format!("secret {cli_var} of target {} isn't set on the server (see its log)", t.id)
-                })?,
-            };
-            env.push((cli_var.into(), value));
-        }
+        env.extend(project::secrets(t, &self.cfg.secrets_dir)?);
         Ok(env)
     }
 
@@ -545,6 +530,7 @@ impl Server {
             env: Some(Arc::new(env)),
             on_write: Some(on_write),
             label: Some(format!("brainproxy-server: {} {}", t.id, run.id)),
+            stateless: None,
         };
         let started = if resume { Ci::resume(args, opts).await } else { Ci::start(args, opts).await };
         let ci = match started {
@@ -928,7 +914,7 @@ fn lock_work(work: &Path) -> Result<File, String> {
 
 /// The kind of network filesystem `path` is on, if it is on one.
 #[cfg(target_os = "linux")]
-fn network_fs(path: &Path) -> Option<&'static str> {
+pub(crate) fn network_fs(path: &Path) -> Option<&'static str> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -951,7 +937,7 @@ fn network_fs(path: &Path) -> Option<&'static str> {
 }
 
 #[cfg(target_os = "macos")]
-fn network_fs(path: &Path) -> Option<&'static str> {
+pub(crate) fn network_fs(path: &Path) -> Option<&'static str> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
@@ -971,7 +957,7 @@ fn network_fs(path: &Path) -> Option<&'static str> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn network_fs(_path: &Path) -> Option<&'static str> {
+pub(crate) fn network_fs(_path: &Path) -> Option<&'static str> {
     None
 }
 

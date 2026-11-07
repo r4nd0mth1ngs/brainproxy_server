@@ -59,6 +59,26 @@ pub struct Options {
     pub on_write: Option<OnWrite>,
     /// Starts each progress line on stderr (default `brainproxy-server`).
     pub label: Option<String>,
+    /// A stateless run (`ci --target`): a fresh project, compared with a known set from a file.
+    pub stateless: Option<Stateless>,
+}
+
+/// What a stateless run brings instead of a run history (research/CI-STATELESS.md).
+#[derive(Clone, Default)]
+pub struct Stateless {
+    /// The known set to compare with; `None`: everything found is new.
+    pub known: Option<PathBuf>,
+    /// The false positives to mark first (`findings mark --from`): the only source of them, so
+    /// taking one off the list reopens its finding.
+    pub suppressions: Option<PathBuf>,
+    /// The coverage of the last run whose scan completed.
+    pub coverage: Option<CoverageBaseline>,
+    /// A path that doesn't exist, the baseline for a run with no known set.
+    pub no_known: PathBuf,
+    /// Its `run.json` fields so far.
+    pub record: record::Stateless,
+    /// Reasons known before the run starts (such as no system scope of the image's).
+    pub notes: Vec<String>,
 }
 
 /// A finished run: its `run.json` and exit code.
@@ -162,7 +182,12 @@ impl Ci {
             }
         }
 
-        let history = record::history(&args.out).map_err(|e| (code::ERROR, format!("reading the run history: {e}")))?;
+        // A stateless run's history is its state, not the run folders next to it.
+        let history = if opts.stateless.is_some() {
+            vec![]
+        } else {
+            record::history(&args.out).map_err(|e| (code::ERROR, format!("reading the run history: {e}")))?
+        };
         let run = Run {
             schema: record::SCHEMA,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -185,11 +210,12 @@ impl Ci {
             summary: None,
             gate: None,
             outcome: Outcome::Running,
-            reasons: vec![],
+            reasons: opts.stateless.as_ref().map(|s| s.notes.clone()).unwrap_or_default(),
             exit_code: None,
             files: vec![],
             baseline: args.baseline,
             folder: None,
+            stateless: opts.stateless.as_ref().map(|s| s.record.clone()),
         };
         Ok(Ci { args, opts, cli, _lock: lock, run, history, cancelled: None, resumed: false })
     }
@@ -406,10 +432,29 @@ impl Ci {
         let mut outcome = if complete { Outcome::Passed } else { Outcome::Incomplete };
         let mut exit = if complete { code::OK } else { code::USAGE };
 
+        if let Err(e) = self.mark().await {
+            self.run.reasons.push(e);
+            if outcome != Outcome::Incomplete {
+                (outcome, exit) = (Outcome::Error, code::ERROR);
+            }
+        }
+
         // Compare. A run that didn't complete is still compared, without the gate, so its drift is kept.
         let mut argv = vec!["findings".to_string(), "compare".into(), "--scan".into(), job.id.to_string()];
         if let Some(p) = &self.run.since_scan {
             argv.extend(["--since-scan".into(), p.job.to_string()]);
+        }
+        if let Some(s) = &self.opts.stateless {
+            // Every state: the next known set needs the false positives that were fixed too.
+            argv.extend(["--state".into(), "all".into()]);
+            match &s.known {
+                Some(k) => argv.extend(["--baseline".into(), k.to_string_lossy().into_owned()]),
+                None => argv.extend([
+                    "--baseline".into(),
+                    s.no_known.to_string_lossy().into_owned(),
+                    "--allow-missing-baseline".into(),
+                ]),
+            }
         }
         argv.extend(["--limit".into(), NO_LIMIT.into()]);
         // With an alert policy the gate is worked out here from the compare output, so the CLI
@@ -433,10 +478,19 @@ impl Ci {
                 let d = cmp.data();
                 if cmp.json["ok"] == true {
                     let s = &d["summary"];
-                    self.run.summary = Some(Summary {
-                        new: s["new"].as_u64().unwrap_or(0),
-                        unchanged: s["unchanged"].as_u64().unwrap_or(0),
-                        fixed: s["fixed"].as_u64().unwrap_or(0),
+                    self.run.summary = Some(if self.opts.stateless.is_some() {
+                        // Listed with `--state all`: count what isn't a false positive, as the CLI does.
+                        let n = |k: &str| {
+                            d[k].as_array().map_or(0, |l| l.iter().filter(|f| f["state"] != "false_positive").count())
+                                as u64
+                        };
+                        Summary { new: n("new"), unchanged: n("unchanged"), fixed: n("fixed") }
+                    } else {
+                        Summary {
+                            new: s["new"].as_u64().unwrap_or(0),
+                            unchanged: s["unchanged"].as_u64().unwrap_or(0),
+                            fixed: s["fixed"].as_u64().unwrap_or(0),
+                        }
                     });
                     if local_gate {
                         if s["truncated"] == true {
@@ -546,6 +600,30 @@ impl Ci {
         (outcome, exit)
     }
 
+    /// A stateless run's marks before the compare: the suppressions list's, so the reports and the
+    /// gate agree with what the team accepted.
+    async fn mark(&mut self) -> Result<(), String> {
+        let Some(s) = self.opts.stateless.clone() else { return Ok(()) };
+        let mut counts = serde_json::Map::new();
+        for (name, file) in [("suppressions", &s.suppressions)] {
+            let Some(file) = file else { continue };
+            let argv = ["findings".into(), "mark".into(), "--from".into(), file.to_string_lossy().into_owned()];
+            let out = call(&self.cli, &argv).await.map_err(|(_, e)| format!("findings mark --from ({name}): {e}"))?;
+            if !out.ok() {
+                return Err(format!("findings mark --from ({name}): {}", out.message()));
+            }
+            let marked = out.data()["marked"].as_array().map_or(0, Vec::len);
+            counts.insert(name.into(), serde_json::json!(marked));
+            for w in out.data()["warnings"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                self.run.reasons.push(format!("findings mark ({name}): {w}"));
+            }
+        }
+        if let Some(st) = self.run.stateless.as_mut() {
+            st.marks = Value::Object(counts);
+        }
+        Ok(())
+    }
+
     /// The newest passed run whose job is still the same job in this project.
     async fn pick_since_scan(&mut self) -> Result<(), Stop> {
         let candidates: Vec<record::Past> = record::since_scan_candidates(&self.history, &self.run).cloned().collect();
@@ -565,6 +643,10 @@ impl Ci {
     }
 
     fn pick_coverage_baseline(&mut self) {
+        if let Some(s) = &self.opts.stateless {
+            self.run.coverage_baseline = s.coverage.clone();
+            return;
+        }
         let base = record::coverage_candidates(&self.history, &self.args.url, &self.args.preset).next();
         self.run.coverage_baseline =
             base.and_then(|p| Some(CoverageBaseline { job: p.run.job.as_ref()?.id, coverage: p.run.coverage? }));
@@ -780,7 +862,7 @@ fn lock(out: &Path) -> Result<File, Refusal> {
 
 /// Becomes `Some(signal name)` on SIGINT or SIGTERM (Ctrl-C elsewhere), and changes again on every
 /// further signal. A CI cancel sends these; the scan job is then stopped and the run ends as incomplete.
-fn cancel_signal() -> watch::Receiver<Option<&'static str>> {
+pub(crate) fn cancel_signal() -> watch::Receiver<Option<&'static str>> {
     let (tx, rx) = watch::channel(None);
     tokio::spawn(async move {
         loop {

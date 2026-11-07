@@ -7,11 +7,14 @@
 
 mod brainproxy;
 mod ci;
+mod notify;
 mod policy;
 mod project;
 mod record;
 mod remote;
 mod serve;
+mod state;
+mod stateless;
 mod target;
 mod time;
 
@@ -186,13 +189,60 @@ struct RemoteWaitOpts {
 }
 
 #[derive(clap::Args)]
+#[command(after_help = "Stateless mode (--target FILE): a fresh project per run, built from the target's \
+    settings (serve's target JSON) or copied from --template, compared with the findings earlier runs \
+    left in --state, which it never changes: the next state goes to <run folder>/state/, for the caller \
+    to keep. URL, scope, preset, gate, login and policy come from the target file. See \
+    research/CI-STATELESS.md and deploy/fargate-oneshot/.")]
 struct CiOpts {
     /// Project file. It must exist and have an engagement scope: `ci` never creates one.
-    #[arg(long)]
-    project: PathBuf,
+    #[arg(long, required_unless_present = "target", conflicts_with = "target")]
+    project: Option<PathBuf>,
     /// URL to crawl and scan; it must be inside the engagement scope.
-    #[arg(long)]
-    url: String,
+    #[arg(long, required_unless_present = "target", conflicts_with = "target")]
+    url: Option<String>,
+    /// Stateless mode: the target's settings, as `serve` registers them (id, base_url, scope,
+    /// preset, gate, auth, secret_env, policy, ...).
+    #[arg(long, value_name = "FILE", requires_all = ["targets", "state"],
+          conflicts_with_all = ["preset", "fail_on", "new_only", "max_minutes", "rate", "auth", "policy"])]
+    target: Option<PathBuf>,
+    /// Stateless: the deployment's targets, `{"targets": ["id", ...]}` (at most 10), listing --target's id.
+    #[arg(long, value_name = "FILE", requires = "target")]
+    targets: Option<PathBuf>,
+    /// Stateless: the state the previous run left (`<run folder>/state/`); missing or empty on a first run.
+    #[arg(long, value_name = "DIR", requires = "target")]
+    state: Option<PathBuf>,
+    /// Stateless: the project to copy for a target with "project": "upload" (vetted as an upload is).
+    #[arg(long, value_name = "FILE", requires = "target")]
+    template: Option<PathBuf>,
+    /// Stateless: findings to mark before comparing, as `brainproxy findings mark --from` takes them.
+    #[arg(long, value_name = "FILE", requires = "target")]
+    suppressions: Option<PathBuf>,
+    /// Stateless: variable holding the key (32+ characters) that signs state.json (state.sig).
+    #[arg(long, value_name = "VAR", requires = "target")]
+    state_key_env: Option<String>,
+    /// Stateless: the generation the caller's pointer names (0 on a first run). A state of another
+    /// generation, or an empty one when N isn't 0, is refused: an older state can't be replayed.
+    #[arg(long, value_name = "N", requires = "target")]
+    expect_generation: Option<u64>,
+    /// Stateless: save the finished project here (`project save`). It holds session tokens.
+    #[arg(long, value_name = "FILE", requires = "target")]
+    keep_project: Option<PathBuf>,
+    /// Stateless: send the target's webhooks and DefectDojo reimport after the run.
+    #[arg(long, requires = "target")]
+    notify: bool,
+    /// Stateless: the commit tested, recorded in run.json.
+    #[arg(long, requires = "target")]
+    commit: Option<String>,
+    /// Stateless: the git ref tested, recorded in run.json.
+    #[arg(long = "ref", value_name = "REF", requires = "target")]
+    git_ref: Option<String>,
+    /// Stateless: target secrets as files, DIR/<target>/<VARIABLE>, else the variables secret_env names.
+    #[arg(long, env = "BRAINPROXY_SERVER_SECRETS_DIR", default_value = "/run/secrets")]
+    secrets_dir: PathBuf,
+    /// Stateless: allow a target on this machine (localhost). Only for trying it out.
+    #[arg(long, requires = "target")]
+    allow_loopback_targets: bool,
     /// Scan depth (`scan active --preset`).
     #[arg(long, value_enum, default_value_t = Preset::Standard)]
     preset: Preset,
@@ -337,6 +387,42 @@ fn serve(o: ServeOpts) -> i32 {
 }
 
 fn ci(o: CiOpts) -> i32 {
+    if let Some(target) = o.target {
+        for (name, value) in [("--commit", &o.commit), ("--ref", &o.git_ref)] {
+            if let Some(v) = value
+                && !target::valid_label(v)
+            {
+                eprintln!("brainproxy-server: {name}: 1-200 characters of letters, digits and . - _ /");
+                return 2;
+            }
+        }
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("brainproxy-server: {e}");
+                return 1;
+            }
+        };
+        return rt.block_on(stateless::run(stateless::Args {
+            brainproxy: o.brainproxy,
+            target,
+            targets: o.targets.unwrap_or_default(),
+            state: o.state.unwrap_or_default(),
+            out: o.out,
+            template: o.template,
+            suppressions: o.suppressions,
+            keep_project: o.keep_project,
+            notify: o.notify,
+            baseline: o.baseline,
+            accept_coverage_drop: o.accept_coverage_drop,
+            commit: o.commit,
+            git_ref: o.git_ref,
+            state_key_env: o.state_key_env,
+            expect_generation: o.expect_generation,
+            secrets_dir: o.secrets_dir,
+            allow_loopback: o.allow_loopback_targets,
+        }));
+    }
     let policy = match o.policy.as_deref().map(policy::load).transpose() {
         Ok(p) => p.unwrap_or_default(),
         Err(e) => {
@@ -353,8 +439,8 @@ fn ci(o: CiOpts) -> i32 {
     };
     rt.block_on(ci::run(ci::Args {
         brainproxy: o.brainproxy,
-        project: o.project,
-        url: o.url,
+        project: o.project.unwrap_or_default(),
+        url: o.url.unwrap_or_default(),
         preset: name(o.preset),
         fail_on: o.fail_on.map(name),
         new_only: o.new_only,

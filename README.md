@@ -75,6 +75,55 @@ also printed on stdout.
 [`contrib/ci/github-actions.yml`](contrib/ci/github-actions.yml) is a complete GitHub Actions
 example.
 
+### Stateless: a fresh project per run
+
+`ci --target FILE` keeps no project between runs, for one-off containers (a Fargate task, a
+Kubernetes Job). Each run builds a project from the target's settings, as `serve` registers them
+(`serve`'s target JSON: id, base_url, scope, preset, gate, auth, secret_env, policy, ownership,
+notify, defectdojo), scans and gates as above, and compares with the findings earlier runs left in
+`--state`. It needs brainproxy 0.5.2 or later (`findings mark --from`).
+
+```sh
+# A first run: --state is empty or missing.
+brainproxy-server ci --target shop-dev.json --targets targets.json --state state/ --out runs/ --baseline
+
+# Each later run reads the state the one before wrote, in <run folder>/state/.
+brainproxy-server ci --target shop-dev.json --targets targets.json --state runs/<folder>/state/ \
+    --out runs/ [--suppressions accepted.json] [--state-key-env STATE_KEY] [--notify] \
+    [--commit SHA] [--ref REF]
+```
+
+- **The state** is `state.json` (target, generation, the settings the known set was found under,
+  the coverage to compare with) and `known.json` (the known findings, a `report json`). `ci` only
+  reads `--state` and writes the next state to `<run folder>/state/`; keeping it is the caller's
+  job. A state that doesn't check out (another target's, changed, signed with another key, a
+  folder with other files but no `state.json`) is refused with exit 1, never taken for a first run.
+- **The known set** only moves on a pass: what a gate-failed or incomplete run found stays new until
+  a run passes. Findings a run didn't cover stay known, so a finding a scan misses once isn't new
+  the next time; a fixed one leaves; one whose host left the scope is dropped. Settings that
+  change what "new" means (URL, preset, login, a laxer gate, another policy) start over: every
+  finding is new until a `--baseline` run.
+- **False positives** come from `--suppressions` alone (a list of `{"alert_ref", "url",
+  "method", "param"}`): marked in the fresh project before the compare, so the reports and the gate
+  agree. The known set carries no marks, so a finding taken off the list opens again. A
+  `--baseline` run ignores the known set and starts over.
+- **`--targets`** lists the deployment's targets (`{"targets": ["shop-dev", ...]}`, at most 10).
+- **`--state-key-env VAR`** signs `state.json` (HMAC-SHA256, `state.sig`) with a key of 32+
+  characters, one per target. Use it wherever more than the scan task can write the state, with
+  **`--expect-generation N`** (the generation your pointer names, 0 on a first run), so an older
+  state can't be replayed and a deleted one isn't taken for a first run.
+- **`--template FILE`** is the project to copy for a target with `"project": "upload"`; it is
+  vetted as an upload is. `--keep-project FILE` saves the finished project (it holds session
+  tokens). Secrets come from `--secrets-dir` (`/run/secrets/<target>/<VAR>`) or the variables
+  `secret_env` names. The CLI gets `BRAINPROXY_HOME` (the pinned rules and checks; `run.json`
+  records their versions in `data_versions`) and `BRAINPROXY_SYSTEM_SCOPE` (else a file with the
+  target's own scope).
+
+`run.json` also has `mode: "stateless"`, `target`, `commit`, `ref`, `state` (the generation read
+and written, whether the known set was used and why not), `marks` and `notifications`.
+[`deploy/fargate-oneshot/`](deploy/fargate-oneshot/) is an example wrapper for AWS (EventBridge,
+Fargate, S3 and DynamoDB).
+
 ## `brainproxy-server serve`
 
 The same pipeline behind an HTTP API, for pipelines that shouldn't hold the project file or reach

@@ -133,6 +133,50 @@ pub struct Run {
     /// The run folder (set when the run ends).
     #[serde(default)]
     pub folder: Option<PathBuf>,
+    /// What only a stateless run (`ci --target`) records; left out in project mode.
+    #[serde(default, flatten, skip_serializing_if = "Option::is_none")]
+    pub stateless: Option<Stateless>,
+}
+
+/// `run.json`'s fields for a stateless run (research/CI-STATELESS.md).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Stateless {
+    /// Always "stateless".
+    pub mode: String,
+    pub target: String,
+    #[serde(default)]
+    pub commit: Option<String>,
+    #[serde(default, rename = "ref")]
+    pub git_ref: Option<String>,
+    pub state: StateUse,
+    /// Findings marked before the compare: `{"known": n, "suppressions": n}`.
+    #[serde(default)]
+    pub marks: serde_json::Value,
+    /// The rules and checks the scan ran with (`scan data status`, `checks status`).
+    #[serde(default)]
+    pub data_versions: serde_json::Value,
+    /// One entry per webhook or DefectDojo delivery (`--notify`).
+    #[serde(default)]
+    pub notifications: Vec<serde_json::Value>,
+}
+
+/// What a stateless run read from `--state`, and what it wrote.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StateUse {
+    /// The generation read; None on a first run.
+    pub read_generation: Option<u64>,
+    /// The run that wrote the known set read.
+    pub known_run: Option<String>,
+    /// The known set was compared against (else every finding was new).
+    pub known_used: bool,
+    /// Why it wasn't, when there was one.
+    pub reason: Option<String>,
+    /// The next state's generation, once written to `<run folder>/state/`.
+    pub written: Option<u64>,
+    /// The known set was replaced (by a pass) rather than carried forward unchanged.
+    pub known_replaced: bool,
+    /// Known findings dropped because their host left the target's scope.
+    pub dropped_out_of_scope: usize,
 }
 
 impl Run {
@@ -191,12 +235,24 @@ pub fn since_scan_candidates<'a>(history: &'a [Past], now: &'a Run) -> impl Iter
 /// and `--new-only` only if `now` has it too. No gate now: anything goes. A changed policy starts
 /// over, since rules can loosen as well as tighten the gate.
 fn gate_as_strict(past: &Run, now: &Run) -> bool {
-    if past.policy != now.policy {
+    gate_settings_as_strict(
+        (past.policy.as_deref(), past.fail_on.as_deref(), past.new_only),
+        (now.policy.as_deref(), now.fail_on.as_deref(), now.new_only),
+    )
+}
+
+/// [`gate_as_strict`] on the settings alone, (policy fingerprint, fail_on, new_only), for a run
+/// known only from a stateless run's state.
+pub fn gate_settings_as_strict(
+    past: (Option<&str>, Option<&str>, bool),
+    now: (Option<&str>, Option<&str>, bool),
+) -> bool {
+    if past.0 != now.0 {
         return false;
     }
-    let Some(want) = now.fail_on.as_deref() else { return true };
-    let Some(had) = past.fail_on.as_deref() else { return false };
-    risk_rank(had) <= risk_rank(want) && (!past.new_only || now.new_only)
+    let Some(want) = now.1 else { return true };
+    let Some(had) = past.1 else { return false };
+    risk_rank(had) <= risk_rank(want) && (!past.2 || now.2)
 }
 
 fn risk_rank(r: &str) -> u8 {
@@ -271,6 +327,7 @@ mod tests {
             files: vec![],
             baseline: false,
             folder: None,
+            stateless: None,
         }
     }
 
