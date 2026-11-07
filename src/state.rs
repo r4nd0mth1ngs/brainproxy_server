@@ -184,7 +184,7 @@ pub fn keys_of(list: &Value) -> HashSet<String> {
 /// plus each instance of `used` (the known set this run compared against) that `found` doesn't
 /// have, isn't in `fixed`, isn't a removed tombstone, and is on a host and port `scope` still
 /// covers. An instance of `used` goes under `found`'s alert of the same `alert_ref` when there is
-/// one, else its own alert (with its `rule_id`) is kept. False-positive marks aren't kept: the
+/// one, else its own alert (with its `rule_id`) is kept. False-positive and accepted-risk marks aren't kept: the
 /// suppressions list is their only source, so a finding taken off it opens again. Returns the set
 /// and how many instances of `used` were dropped for being out of scope.
 pub fn carry_forward(found: &Value, used: Option<&Value>, fixed: &HashSet<String>, scope: &[String]) -> (Value, usize) {
@@ -235,7 +235,7 @@ pub fn carry_forward(found: &Value, used: Option<&Value>, fixed: &HashSet<String
         }
     }
     for i in alerts.iter_mut().flat_map(|a| a["instances"].as_array_mut().into_iter().flatten()) {
-        if i["state"] == "false_positive" {
+        if crate::policy::dismissed(i) {
             i["state"] = json!("open");
         }
     }

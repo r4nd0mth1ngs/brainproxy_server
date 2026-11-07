@@ -110,6 +110,11 @@ fn action_for<'a>(policy: &'a Policy, alert_ref: &str) -> Option<&'a Action> {
     policy.get(alert_ref).or_else(|| alert_ref.split_once('-').and_then(|(id, _)| policy.get(id)))
 }
 
+/// A finding marked not to be fixed: a false positive or an accepted risk.
+pub fn dismissed(f: &Value) -> bool {
+    matches!(f["state"].as_str(), Some("false_positive" | "accepted_risk"))
+}
+
 /// The gate over `findings compare` output (its `new` and `unchanged` lists), under `policy`.
 pub fn gate(compare: &Value, fail_on: Option<&str>, new_only: bool, policy: &Policy) -> Gate {
     let threshold = fail_on.and_then(risk_rank);
@@ -119,8 +124,10 @@ pub fn gate(compare: &Value, fail_on: Option<&str>, new_only: bool, policy: &Pol
     }
     let mut result = PolicyResult::default();
     let mut count = 0;
-    // A stateless run lists false positives too (`--state all`); they never count, as in the CLI's gate.
-    let counted = |f: &&Value| !matches!(f["state"].as_str(), Some("false_positive" | "removed"));
+    // A stateless run lists false positives too (`--state all`); they never count, as in the CLI's
+    // gate, and nor do accepted risks or findings marked fixed.
+    let counted =
+        |f: &&Value| !matches!(f["state"].as_str(), Some("false_positive" | "accepted_risk" | "fixed" | "removed"));
     for f in lists.into_iter().filter_map(Value::as_array).flatten().filter(counted) {
         let alert_ref = f["alert_ref"].as_str().unwrap_or("");
         let by_risk = threshold.is_some_and(|t| finding_rank(f) >= t);
@@ -212,6 +219,12 @@ mod tests {
         assert!(!gate(&json!({"new": [finding("1", "Informational")]}), Some("info"), false, &p).passed);
         let cut = json!({"new": [], "summary": {"truncated": true}});
         assert!(!gate(&cut, Some("high"), false, &p).passed);
+        // Dismissed or fixed findings never count.
+        for state in ["false_positive", "accepted_risk", "fixed", "removed"] {
+            let mut f = finding("1", "high");
+            f["state"] = json!(state);
+            assert!(gate(&json!({"new": [f]}), Some("high"), false, &none).passed, "{state}");
+        }
         // The variant wins over the id.
         let p = parse("10020\tFAIL\n10020-1\tIGNORE\n").unwrap();
         assert!(gate(&json!({"new": [finding("10020-1", "medium")]}), None, false, &p).passed);

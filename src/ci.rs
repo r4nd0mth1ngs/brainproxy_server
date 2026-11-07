@@ -479,9 +479,10 @@ impl Ci {
                 if cmp.json["ok"] == true {
                     let s = &d["summary"];
                     self.run.summary = Some(if self.opts.stateless.is_some() {
-                        // Listed with `--state all`: count what isn't a false positive, as the CLI does.
+                        // Listed with `--state all`: count what isn't a false positive or an accepted
+                        // risk, as the CLI does.
                         let n = |k: &str| {
-                            d[k].as_array().map_or(0, |l| l.iter().filter(|f| f["state"] != "false_positive").count())
+                            d[k].as_array().map_or(0, |l| l.iter().filter(|f| !crate::policy::dismissed(f)).count())
                                 as u64
                         };
                         Summary { new: n("new"), unchanged: n("unchanged"), fixed: n("fixed") }

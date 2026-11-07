@@ -547,11 +547,12 @@ impl Note {
 
     /// From a run's `run.json` and its `compare.json` (or null); `run` names it (the run folder).
     pub fn from_run(target: &str, run: &str, r: &Value, event: Event, compare: &Value) -> Note {
-        let rank = |risk: &str| ["high", "medium", "low", "info"].iter().position(|x| *x == risk).unwrap_or(4);
+        let rank =
+            |risk: &str| ["critical", "high", "medium", "low", "info"].iter().position(|x| *x == risk).unwrap_or(5);
         let new = compare["data"]["new"].as_array().cloned().unwrap_or_default();
         let mut found: Vec<(String, String)> = new
             .iter()
-            .filter(|f| f["state"] != "false_positive")
+            .filter(|f| !crate::policy::dismissed(f))
             .map(|f| (f["name"].as_str().unwrap_or("?").to_string(), f["risk"].as_str().unwrap_or("?").to_string()))
             .collect();
         found.sort_by_key(|(_, risk)| rank(risk));
