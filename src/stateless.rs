@@ -14,9 +14,8 @@ use crate::brainproxy::{Cli, code};
 use crate::ci::{self, Ci, Options};
 use crate::project::{self, Refused};
 use crate::record::{self, CoverageBaseline, Outcome, Run, StateUse};
-use crate::serve::db::MAX_TARGETS;
 use crate::state::{self, CoverageState, Known, State};
-use crate::target::{self, ProjectSource, TargetConfig};
+use crate::target::{self, MAX_TARGETS, ProjectSource, TargetConfig};
 
 #[derive(Debug, Clone)]
 pub struct Args {

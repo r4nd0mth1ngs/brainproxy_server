@@ -9,8 +9,7 @@ use serde_json::{Value, json};
 
 use crate::target::TargetConfig;
 
-/// The most targets one server scans. Deliberately not a setting: the service is not a DAST platform.
-pub const MAX_TARGETS: usize = 10;
+pub use crate::target::MAX_TARGETS;
 
 /// `PRAGMA user_version` of `control.db`.
 const SCHEMA_VERSION: i64 = 1;

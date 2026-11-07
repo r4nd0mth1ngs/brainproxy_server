@@ -47,6 +47,10 @@ pub fn valid_secret_var(name: &str) -> bool {
         && name != "HOSTNAME"
 }
 
+/// The most targets one server scans. Deliberately not a setting: the service is not a DAST platform.
+/// The product's limit (PolyForm Shield): `serve`'s registry and stateless `ci`'s `--targets`.
+pub const MAX_TARGETS: usize = 10;
+
 pub const PRESETS: [&str; 3] = ["quick", "standard", "thorough"];
 pub const RISKS: [&str; 4] = ["info", "low", "medium", "high"];
 
