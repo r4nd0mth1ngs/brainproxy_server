@@ -9,8 +9,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{notify, oidc};
 use crate::policy::{self, Policy};
+use crate::serve::{notify, oidc};
 
 /// `[a-z0-9-]{1,32}`, not starting or ending with `-`: used in paths, file names and tokens.
 pub fn valid_id(id: &str) -> bool {

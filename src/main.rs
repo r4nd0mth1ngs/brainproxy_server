@@ -8,9 +8,11 @@
 mod brainproxy;
 mod ci;
 mod policy;
+mod project;
 mod record;
 mod remote;
 mod serve;
+mod target;
 mod time;
 
 use std::net::SocketAddr;

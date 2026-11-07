@@ -36,7 +36,8 @@ use serde_json::json;
 
 use tokio::sync::{mpsc, oneshot};
 
-use super::{Server, target};
+use super::Server;
+use crate::target;
 
 /// Changes are gathered for this long before an upload.
 const DEBOUNCE: Duration = Duration::from_secs(5);

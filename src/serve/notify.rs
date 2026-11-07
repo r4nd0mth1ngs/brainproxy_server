@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::db::{AuditEntry, RunRow, state};
-use super::target::valid_secret_var;
 use super::{Server, auth, oidc};
+use crate::target::valid_secret_var;
 use crate::time;
 
 /// The most hooks a target may have.

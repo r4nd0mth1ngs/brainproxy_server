@@ -18,7 +18,6 @@ pub mod db;
 pub mod notify;
 pub mod oidc;
 pub mod store;
-pub mod target;
 pub mod ui;
 
 use std::collections::{HashMap, HashSet};
@@ -34,11 +33,12 @@ use tokio::sync::{Notify, watch};
 
 use crate::brainproxy::{self, Cli, code};
 use crate::ci::{self, Ci, Options};
+use crate::project;
 use crate::record::{Outcome, Run};
+use crate::target::{self, ProjectSource, TargetConfig};
 use crate::time;
 use api::ApiError;
 use db::{AuditEntry, Db, RunRow, state};
-use target::{ProjectSource, ScopeEntry, TargetConfig};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -87,46 +87,6 @@ where
     T: serde::Deserialize<'de>,
 {
     T::deserialize(d).map(Some)
-}
-
-/// GETs a small text file over HTTP(S): no redirects, 10 s, 4 KB. Certificates aren't checked:
-/// dev instances often have self-signed ones, nothing secret is sent, and the ownership check
-/// guards against typos, not attackers.
-/// It connects only to `addrs`, never through a proxy.
-fn fetch_small(url: &str, addrs: Vec<SocketAddr>) -> Result<String, String> {
-    let tls = ureq::tls::TlsConfig::builder().disable_verification(true).build();
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .proxy(None)
-        .tls_config(tls)
-        .build();
-    let agent = ureq::Agent::with_parts(config, ureq::unversioned::transport::DefaultConnector::new(), Pinned(addrs));
-    let mut resp = agent.get(url).call().map_err(|e| format!("{url}: {e}"))?;
-    if resp.status() != 200 {
-        return Err(format!("{url}: HTTP {}", resp.status()));
-    }
-    resp.body_mut().with_config().limit(4096).read_to_string().map_err(|e| format!("{url}: {e}"))
-}
-
-/// A resolver that answers every name with the addresses it was given.
-#[derive(Debug)]
-struct Pinned(Vec<SocketAddr>);
-
-impl ureq::unversioned::resolver::Resolver for Pinned {
-    fn resolve(
-        &self,
-        _uri: &axum::http::Uri,
-        _config: &ureq::config::Config,
-        _timeout: ureq::unversioned::transport::NextTimeout,
-    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
-        let mut out = self.empty();
-        for a in self.0.iter().take(16) {
-            out.push(*a);
-        }
-        if out.is_empty() { Err(ureq::Error::HostNotFound) } else { Ok(out) }
-    }
 }
 
 /// How long an `Idempotency-Key` answers a repeated trigger with its run.
@@ -543,12 +503,12 @@ impl Server {
         let project = self.target_dir(&t.id).join("project.bpdb");
         let cli = self.cli(project.clone(), env.clone());
         // DNS can change after registration: the base host must still resolve to allowed addresses.
-        let addrs = match self.check_host(&cli, t).await {
+        let addrs = match project::check_host(&cli, t, self.cfg.allow_loopback_targets).await {
             Ok(a) => a,
             Err((c, e)) => return End::failed(c, e),
         };
         if t.ownership
-            && let Err(e) = self.check_ownership(t, addrs).await
+            && let Err(e) = project::check_ownership(t, addrs).await
         {
             return End::failed(code::OUT_OF_SCOPE, format!("ownership check: {e}"));
         }
@@ -609,48 +569,6 @@ impl Server {
             Outcome::Error | Outcome::Running => (state::FAILED, "error"),
         };
         End { state, outcome, exit: done.exit, run: serde_json::to_value(&done.run).ok(), note: None }
-    }
-
-    /// `engagement check` of the base URL's host and every other host name in the scope: allowed,
-    /// and not resolving to this machine or a link-local address (a registered name pointed at the
-    /// server itself would reach its admin port).
-    /// Checks every scope host's resolved addresses; returns the base URL host's, as the CLI
-    /// resolves it (host overrides included).
-    async fn check_host(&self, cli: &Cli, t: &TargetConfig) -> Result<Vec<std::net::IpAddr>, (i32, String)> {
-        let (host, port) = target::url_host_port(&t.base_url).map_err(|e| (code::USAGE, e))?;
-        let base = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
-        let mut names = vec![(base, true)];
-        for s in &t.scope {
-            if let Ok(ScopeEntry::Host { name, port }) = ScopeEntry::parse(s, true) {
-                names.push((format!("{name}:{}", port.unwrap_or(443)), false));
-            }
-        }
-        let mut base_addrs = Vec::new();
-        for (name, must_be_allowed) in names {
-            let out = cli
-                .run(["engagement", "check", &name])
-                .await
-                .map_err(|e| (code::ERROR, format!("can't run {}: {e}", cli.bin.display())))?;
-            if !out.ok() {
-                let c = if out.code == code::OK { code::ERROR } else { out.code };
-                return Err((c, format!("engagement check: {}", out.message())));
-            }
-            let result = &out.data()["results"][0];
-            if must_be_allowed && result["allowed"] != true {
-                let why = result["reason"].as_str().unwrap_or("not allowed");
-                return Err((code::OUT_OF_SCOPE, format!("{name}: {why}")));
-            }
-            for a in result["addresses"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                let Ok(ip) = a.parse::<std::net::IpAddr>() else { continue };
-                if let Err(e) = target::check_ip(ip, self.cfg.allow_loopback_targets) {
-                    return Err((code::OUT_OF_SCOPE, format!("{name} resolves to {ip}: {e}")));
-                }
-                if must_be_allowed {
-                    base_addrs.push(ip);
-                }
-            }
-        }
-        Ok(base_addrs)
     }
 
     /// `project save` into `snapshots/<run>.bpdb`, keeping the newest `keep_snapshots`.
@@ -792,29 +710,6 @@ impl Server {
         Ok(t.public_json())
     }
 
-    /// Fetches `/.well-known/brainproxy-<id>.txt` from the target's origin and looks for its token.
-    /// It connects only to `addrs`, the addresses `check_host` just vetted, so a name resolving
-    /// elsewhere a moment later can't send the request anywhere else.
-    async fn check_ownership(&self, t: &TargetConfig, addrs: Vec<std::net::IpAddr>) -> Result<(), String> {
-        let Some(token) = t.ownership_token.clone() else { return Err("ownership is on but has no token".into()) };
-        let (host, port) = target::url_host_port(&t.base_url)?;
-        let scheme = if t.base_url.starts_with("https://") { "https" } else { "http" };
-        let host = if host.contains(':') { format!("[{host}]") } else { host };
-        let url = format!("{scheme}://{host}:{port}/.well-known/brainproxy-{}.txt", t.id);
-        let shown = url.clone();
-        if addrs.is_empty() {
-            return Err(format!("{} resolved to no addresses", t.base_url));
-        }
-        let pinned: Vec<SocketAddr> = addrs.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
-        let body =
-            tokio::task::spawn_blocking(move || fetch_small(&url, pinned)).await.map_err(|e| e.to_string())??;
-        if body.lines().any(|l| l.trim() == token) {
-            Ok(())
-        } else {
-            Err(format!("{shown} doesn't hold this target's ownership token"))
-        }
-    }
-
     /// Creates the project (or a scratch one for an upload target) in `dir` and checks the base URL
     /// against the scope that will be in force: the engagement plus the system scope with this target.
     async fn prepare_target(&self, t: &TargetConfig, dir: &Path) -> Result<(), ApiError> {
@@ -829,18 +724,9 @@ impl Server {
         env.push(("BRAINPROXY_SYSTEM_SCOPE".into(), candidate.into_os_string()));
         let name = if t.project == ProjectSource::Generate { "project.bpdb" } else { "check.bpdb" };
         let cli = self.cli(dir.join(name), env);
-        let mut argv = vec!["engagement".to_string(), "start".into()];
-        for s in &t.scope {
-            argv.push(format!("--target={s}"));
-        }
-        argv.push(format!("--name={}", t.id));
-        cli_ok(&cli, &argv).await?;
-        if t.project == ProjectSource::Generate
-            && let Some(a) = &t.auth
-        {
-            cli_ok(&cli, &a.argv()).await?;
-        }
-        self.check_host(&cli, t).await.map(drop).map_err(|(c, e)| {
+        let auth = if t.project == ProjectSource::Generate { t.auth.as_ref() } else { None };
+        project::create(&cli, t, auth).await?;
+        project::check_host(&cli, t, self.cfg.allow_loopback_targets).await.map(drop).map_err(|(c, e)| {
             ApiError::invalid(format!("base_url {}: {e}", t.base_url)).with_kind(if c == code::OUT_OF_SCOPE {
                 "out_of_scope"
             } else {
@@ -862,84 +748,8 @@ impl Server {
         let target = self.db().target(id).map_err(ApiError::db)?.ok_or_else(|| ApiError::not_found("target"))?;
         let t = &target.config;
         self.claim(id)?;
-        let mut magic = [0u8; 16];
-        use std::io::Read;
-        let is_sqlite =
-            File::open(file).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"SQLite format 3\0";
-        if !is_sqlite {
-            return Err(ApiError::invalid("the upload is not a brainproxy project (SQLite) file"));
-        }
         let cli = self.cli(file.to_path_buf(), base_env(&self.cfg));
-        let eng = cli_ok(&cli, ["engagement", "show"]).await?;
-        let e = &eng.data()["engagement"];
-        if e.is_null() {
-            return Err(ApiError::invalid("the project has no engagement scope"));
-        }
-        let allowed: Vec<String> = t.scope.clone();
-        for inc in e["include"].as_array().into_iter().flatten() {
-            let s = inc.as_str().unwrap_or_default();
-            let norm = ScopeEntry::parse(s, self.cfg.allow_loopback_targets).map(|x| x.to_string());
-            if !norm.as_ref().is_ok_and(|n| allowed.contains(n)) {
-                return Err(ApiError::invalid(format!(
-                    "the project's scope includes {s}, which isn't in the target's registered scope ({})",
-                    allowed.join(", ")
-                ))
-                .with_kind("out_of_scope"));
-            }
-        }
-        if eng.data()["engagement_proxies"].as_array().is_some_and(|p| !p.is_empty()) {
-            return Err(ApiError::invalid("the project allows upstream proxies; the server doesn't accept those"));
-        }
-        // Connection settings the CLI applies on top of the scope: an upstream proxy (allowed on
-        // loopback by the CLI) or a host override to an address the scope doesn't list would send
-        // the scan somewhere the registration never named.
-        let conn = cli_ok(&cli, ["connection", "show"]).await?;
-        let c = conn.data();
-        // An allowlist: host overrides (checked below) and nothing else, including keys a later CLI
-        // may add. Client certificates are file paths read on the server, which could name another
-        // target's secret files.
-        for (key, value) in c.as_object().into_iter().flatten() {
-            let empty = value.as_array().is_some_and(Vec::is_empty);
-            if !matches!(key.as_str(), "hosts" | "warnings" | "note") && !empty && !value.is_null() {
-                return Err(ApiError::invalid(format!(
-                    "the project has connection settings the server doesn't accept (`connection {key}`); \
-                     only host overrides to addresses in the scope"
-                )));
-            }
-        }
-        let entries: Vec<ScopeEntry> =
-            t.scope.iter().filter_map(|s| ScopeEntry::parse(s, self.cfg.allow_loopback_targets).ok()).collect();
-        for h in c["hosts"].as_array().into_iter().flatten() {
-            let ip_text = h["ip"].as_str().unwrap_or_default();
-            let listed = ip_text.parse::<std::net::IpAddr>().ok().filter(|ip| {
-                target::check_ip(*ip, self.cfg.allow_loopback_targets).is_ok()
-                    && entries.iter().any(|e| e.covers_addr(*ip))
-            });
-            if listed.is_none() {
-                return Err(ApiError::invalid(format!(
-                    "the project maps {} to {ip_text}, an address the target's scope doesn't list",
-                    h["host"].as_str().unwrap_or("?")
-                ))
-                .with_kind("out_of_scope"));
-            }
-        }
-        let profiles = cli_ok(&cli, ["auth", "list"]).await?;
-        let mut names = Vec::new();
-        for p in profiles.data()["profiles"].as_array().into_iter().flatten() {
-            let name = p["name"].as_str().unwrap_or_default().to_string();
-            let shown = cli_ok(&cli, ["auth", "show", &name]).await?;
-            if !shown.data()["profile"]["password"]["literal"].is_null() {
-                return Err(ApiError::invalid(format!(
-                    "auth profile {name} stores its password in the project; use --password-env and the target's secret_env"
-                )));
-            }
-            names.push(name);
-        }
-        if let Some(p) = t.profile()
-            && !names.iter().any(|n| n == p)
-        {
-            return Err(ApiError::invalid(format!("the project has no auth profile {p}")));
-        }
+        let vetted = project::vet(&cli, t, self.cfg.allow_loopback_targets).await?;
         // A clean, consistent copy (no WAL side files); `project save` reads every page.
         let clean = file.with_file_name("clean.bpdb");
         cli_ok(&cli, [OsString::from("project"), "save".into(), "--output".into(), clean.clone().into_os_string()])
@@ -960,7 +770,7 @@ impl Server {
         std::fs::rename(&clean, &project).map_err(ApiError::io)?;
         self.db().set_project_ready(id).map_err(ApiError::db)?;
         self.sync(store::Item::Project { target: id.to_string(), snapshot: None });
-        Ok(json!({"target": id, "project_ready": true, "scope": e["include"], "profiles": names}))
+        Ok(json!({"target": id, "project_ready": true, "scope": vetted.scope, "profiles": vetted.profiles}))
     }
 
     /// Marks a target busy for an upload or removal (until the caller's [`Busy`] drops); 409 while

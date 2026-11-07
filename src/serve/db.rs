@@ -7,7 +7,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde_json::{Value, json};
 
-use super::target::TargetConfig;
+use crate::target::TargetConfig;
 
 /// The most targets one server scans. Deliberately not a setting: the service is not a DAST platform.
 pub const MAX_TARGETS: usize = 10;

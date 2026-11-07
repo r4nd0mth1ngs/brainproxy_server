@@ -23,8 +23,8 @@ use tokio::io::AsyncWriteExt;
 
 use super::auth::{self, Bucket};
 use super::db::{self, AuditEntry, Perm, RunRow, Token, state};
-use super::target::{self, TargetConfig};
 use super::{DEDUP_MS, Server, TargetPatch, oidc};
+use crate::target::{self, TargetConfig};
 use crate::time;
 
 /// Request bodies other than a project upload.
@@ -85,6 +85,17 @@ impl ApiError {
     pub fn with_kind(mut self, kind: &'static str) -> ApiError {
         self.kind = kind;
         self
+    }
+}
+
+impl From<crate::project::Refused> for ApiError {
+    fn from(r: crate::project::Refused) -> ApiError {
+        use crate::project::Refused;
+        match r {
+            Refused::Invalid(m) => ApiError::invalid(m),
+            Refused::OutOfScope(m) => ApiError::invalid(m).with_kind("out_of_scope"),
+            Refused::Internal(m) => ApiError::internal(m),
+        }
     }
 }
 
