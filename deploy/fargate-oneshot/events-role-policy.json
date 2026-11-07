@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RunTheTargetsTask",
+      "Effect": "Allow",
+      "Action": "ecs:RunTask",
+      "Resource": "arn:aws:ecs:eu-west-1:111122223333:task-definition/brainproxy-ci-shop-dev:*",
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": "arn:aws:ecs:eu-west-1:111122223333:cluster/brainproxy"
+        }
+      }
+    },
+    {
+      "Sid": "TagTheTask",
+      "Effect": "Allow",
+      "Action": "ecs:TagResource",
+      "Resource": "arn:aws:ecs:eu-west-1:111122223333:task/brainproxy/*",
+      "Condition": {
+        "StringEquals": {
+          "ecs:CreateAction": "RunTask"
+        }
+      }
+    },
+    {
+      "Sid": "PassTheTasksRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::111122223333:role/brainproxy-ci-shop-dev-task",
+        "arn:aws:iam::111122223333:role/brainproxy-ci-shop-dev-execution"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    }
+  ]
+}

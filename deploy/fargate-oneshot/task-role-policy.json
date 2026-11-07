@@ -1,0 +1,87 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConfigRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::my-brainproxy-ci-config/brainproxy-ci/config/targets.json",
+        "arn:aws:s3:::my-brainproxy-ci-config/brainproxy-ci/config/targets/shop-dev/*"
+      ]
+    },
+    {
+      "Sid": "ConfigList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-brainproxy-ci-config",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "brainproxy-ci/config/targets/shop-dev/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ConfigRunOptionsDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-brainproxy-ci-config/brainproxy-ci/config/targets/shop-dev/run-options.json"
+    },
+    {
+      "Sid": "StateRead",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-brainproxy-ci-state/brainproxy-ci/state/shop-dev/*"
+    },
+    {
+      "Sid": "StateAndRunsWrite",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::my-brainproxy-ci-state/brainproxy-ci/state/shop-dev/*",
+        "arn:aws:s3:::my-brainproxy-ci-state/brainproxy-ci/runs/shop-dev/*"
+      ]
+    },
+    {
+      "Sid": "StateList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-brainproxy-ci-state",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "brainproxy-ci/state/shop-dev/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "PointerLeaseDedupe",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem"
+      ],
+      "Resource": "arn:aws:dynamodb:eu-west-1:111122223333:table/brainproxy-ci",
+      "Condition": {
+        "ForAllValues:StringLike": {
+          "dynamodb:LeadingKeys": [
+            "pointer#shop-dev",
+            "lease#shop-dev",
+            "event#shop-dev#*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "StateKey",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:eu-west-1:111122223333:secret:brainproxy/state-key/shop-dev-??????"
+    }
+  ]
+}

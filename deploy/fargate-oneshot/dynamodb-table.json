@@ -1,0 +1,62 @@
+{
+  "table": {
+    "TableName": "brainproxy-ci",
+    "AttributeDefinitions": [
+      {
+        "AttributeName": "pk",
+        "AttributeType": "S"
+      }
+    ],
+    "KeySchema": [
+      {
+        "AttributeName": "pk",
+        "KeyType": "HASH"
+      }
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+    "SSESpecification": {
+      "Enabled": true
+    },
+    "DeletionProtectionEnabled": true,
+    "Tags": [
+      {
+        "Key": "app",
+        "Value": "brainproxy-ci"
+      }
+    ]
+  },
+  "timeToLive": {
+    "TableName": "brainproxy-ci",
+    "TimeToLiveSpecification": {
+      "Enabled": true,
+      "AttributeName": "expires_at"
+    }
+  },
+  "pointInTimeRecovery": {
+    "TableName": "brainproxy-ci",
+    "PointInTimeRecoverySpecification": {
+      "PointInTimeRecoveryEnabled": true
+    }
+  },
+  "exampleItems": {
+    "pointer": {
+      "pk": {"S": "pointer#shop-dev"},
+      "target": {"S": "shop-dev"},
+      "generation": {"N": "42"},
+      "state_prefix": {"S": "brainproxy-ci/state/shop-dev/42-20261106T101500Z-1"},
+      "run": {"S": "20261106T101500Z-1"},
+      "updated_at": {"N": "1793956898"}
+    },
+    "lease": {
+      "pk": {"S": "lease#shop-dev"},
+      "owner": {"S": "6f1c2e0a-3b7d-4c55-9e1f-0d2a8b9c4e71"},
+      "event": {"S": "0b4c1f3e-8a2d-4e6f-b1c9-7d5e3a2f1b08"},
+      "expires_at": {"N": "1793962298"}
+    },
+    "dedupe": {
+      "pk": {"S": "event#shop-dev#0b4c1f3e-8a2d-4e6f-b1c9-7d5e3a2f1b08"},
+      "owner": {"S": "6f1c2e0a-3b7d-4c55-9e1f-0d2a8b9c4e71"},
+      "expires_at": {"N": "1794561698"}
+    }
+  }
+}

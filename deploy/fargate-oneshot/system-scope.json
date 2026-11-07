@@ -1,0 +1,5 @@
+{
+  "name": "brainproxy-ci example: the network these scan tasks may reach",
+  "include": ["shop-dev.example.test:443"],
+  "exclude": []
+}

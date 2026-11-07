@@ -1,0 +1,127 @@
+{
+  "family": "brainproxy-ci-shop-dev",
+  "requiresCompatibilities": [
+    "FARGATE"
+  ],
+  "networkMode": "awsvpc",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "cpu": "1024",
+  "memory": "4096",
+  "ephemeralStorage": {
+    "sizeInGiB": 40
+  },
+  "taskRoleArn": "arn:aws:iam::111122223333:role/brainproxy-ci-shop-dev-task",
+  "executionRoleArn": "arn:aws:iam::111122223333:role/brainproxy-ci-shop-dev-execution",
+  "volumes": [
+    {
+      "name": "work"
+    },
+    {
+      "name": "tmp"
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "brainproxy-ci",
+      "image": "111122223333.dkr.ecr.eu-west-1.amazonaws.com/brainproxy-ci:TAG",
+      "essential": true,
+      "entryPoint": [
+        "/sbin/tini",
+        "--",
+        "/usr/local/bin/ci-entrypoint"
+      ],
+      "environment": [
+        {
+          "name": "CONFIG_BUCKET",
+          "value": "my-brainproxy-ci-config"
+        },
+        {
+          "name": "CONFIG_PREFIX",
+          "value": "brainproxy-ci/config"
+        },
+        {
+          "name": "STATE_BUCKET",
+          "value": "my-brainproxy-ci-state"
+        },
+        {
+          "name": "STATE_PREFIX",
+          "value": "brainproxy-ci"
+        },
+        {
+          "name": "TABLE",
+          "value": "brainproxy-ci"
+        },
+        {
+          "name": "STATE_KEY_SECRET_ID",
+          "value": "arn:aws:secretsmanager:eu-west-1:111122223333:secret:brainproxy/state-key/shop-dev-AbCdEf"
+        },
+        {
+          "name": "BRAINPROXY_SYSTEM_SCOPE",
+          "value": "/etc/brainproxy-ci/system-scope.json"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "eu-west-1"
+        },
+        {
+          "name": "HOME",
+          "value": "/work/home"
+        },
+        {
+          "name": "TMPDIR",
+          "value": "/tmp"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "SHOP_DEV_APP_PASSWORD",
+          "valueFrom": "arn:aws:secretsmanager:eu-west-1:111122223333:secret:brainproxy-ci/shop-dev/app-password-AbCdEf"
+        }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "work",
+          "containerPath": "/work",
+          "readOnly": false
+        },
+        {
+          "sourceVolume": "tmp",
+          "containerPath": "/tmp",
+          "readOnly": false
+        }
+      ],
+      "readonlyRootFilesystem": true,
+      "user": "1000:1000",
+      "linuxParameters": {
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        }
+      },
+      "stopTimeout": 120,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/brainproxy-ci",
+          "awslogs-region": "eu-west-1",
+          "awslogs-stream-prefix": "shop-dev",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "key": "app",
+      "value": "brainproxy-ci"
+    },
+    {
+      "key": "target",
+      "value": "shop-dev"
+    }
+  ]
+}

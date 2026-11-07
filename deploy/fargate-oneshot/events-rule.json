@@ -1,0 +1,50 @@
+{
+  "rule": {
+    "Name": "brainproxy-ci-shop-dev",
+    "Description": "Example: one rule per target. Starts a stateless brainproxy-server ci run of shop-dev.",
+    "EventBusName": "default",
+    "EventPattern": "{\"source\":[\"ci.pipeline.shop-dev\"],\"detail-type\":[\"brainproxy scan requested\"]}",
+    "State": "ENABLED"
+  },
+  "targets": {
+    "Rule": "brainproxy-ci-shop-dev",
+    "EventBusName": "default",
+    "Targets": [
+      {
+        "Id": "brainproxy-ci-shop-dev",
+        "Arn": "arn:aws:ecs:eu-west-1:111122223333:cluster/brainproxy",
+        "RoleArn": "arn:aws:iam::111122223333:role/brainproxy-ci-events",
+        "EcsParameters": {
+          "TaskDefinitionArn": "arn:aws:ecs:eu-west-1:111122223333:task-definition/brainproxy-ci-shop-dev",
+          "TaskCount": 1,
+          "LaunchType": "FARGATE",
+          "PlatformVersion": "LATEST",
+          "NetworkConfiguration": {
+            "awsvpcConfiguration": {
+              "Subnets": [
+                "subnet-0123456789abcdef0",
+                "subnet-0fedcba9876543210"
+              ],
+              "SecurityGroups": [
+                "sg-0aaaaaaaaaaaaaaa0"
+              ],
+              "AssignPublicIp": "DISABLED"
+            }
+          },
+          "PropagateTags": "TASK_DEFINITION",
+          "EnableExecuteCommand": false
+        },
+        "InputTransformer": {
+          "InputTemplate": "{\"containerOverrides\":[{\"name\":\"brainproxy-ci\",\"environment\":[{\"name\":\"TARGET_ID\",\"value\":\"shop-dev\"},{\"name\":\"EVENT_ID\",\"value\":\"<aws.events.event.id>\"}]}]}"
+        },
+        "RetryPolicy": {
+          "MaximumRetryAttempts": 3,
+          "MaximumEventAgeInSeconds": 3600
+        },
+        "DeadLetterConfig": {
+          "Arn": "arn:aws:sqs:eu-west-1:111122223333:brainproxy-ci-dlq"
+        }
+      }
+    ]
+  }
+}
