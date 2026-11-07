@@ -81,7 +81,7 @@ example.
 Kubernetes Job). Each run builds a project from the target's settings, as `serve` registers them
 (`serve`'s target JSON: id, base_url, scope, preset, gate, auth, secret_env, policy, ownership,
 notify, defectdojo), scans and gates as above, and compares with the findings earlier runs left in
-`--state`. It needs brainproxy 0.5.2 or later (`findings mark --from`).
+`--state`. It needs brainproxy 0.6.0 or later (`findings mark --from`).
 
 ```sh
 # A first run: --state is empty or missing.

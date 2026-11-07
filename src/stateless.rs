@@ -399,7 +399,7 @@ fn cli_env(
 }
 
 /// Stateless runs need `findings mark --from` (and `findings compare --scan --baseline`, which came
-/// with it): brainproxy 0.5.2.
+/// with it): brainproxy 0.6.0.
 async fn check_cli(cli: &Cli) -> Result<(), Refusal> {
     let out = cli
         .run(["capabilities", "findings", "mark"])
@@ -407,7 +407,7 @@ async fn check_cli(cli: &Cli) -> Result<(), Refusal> {
         .map_err(|e| (code::ERROR, format!("can't run {}: {e}", cli.bin.display())))?;
     let has_from = out.data()["args"].as_array().into_iter().flatten().any(|a| a["flag"] == "--from");
     if !has_from {
-        return Err((code::ERROR, "stateless ci needs brainproxy 0.5.2 or later (findings mark --from)".into()));
+        return Err((code::ERROR, "stateless ci needs brainproxy 0.6.0 or later (findings mark --from)".into()));
     }
     Ok(())
 }

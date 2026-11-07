@@ -224,6 +224,6 @@ task's stopped event, which an EventBridge rule can route to an alarm.
 - **Retention.** Add an S3 lifecycle rule on `runs/` and on `state/` (old generations; the pointer
   names the current one) and turn on versioning for the state bucket. `--keep-project` is off: a
   finished project holds session cookies and tokens.
-- **CLI version.** Stateless `ci` needs brainproxy 0.5.2 or later in the image (it checks that
+- **CLI version.** Stateless `ci` needs brainproxy 0.6.0 or later in the image (it checks that
   `findings mark --from` exists): build the server image with `--build-arg BRAINPROXY_VERSION` and
   both checksums for that release.

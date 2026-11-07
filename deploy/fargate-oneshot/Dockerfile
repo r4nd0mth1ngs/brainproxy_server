@@ -1,5 +1,5 @@
 # Example: the stateless `ci` task's image. It is the server image (docker/server.Dockerfile, built
-# with a brainproxy CLI of 0.5.2 or later) plus the AWS CLI, jq, this folder's entrypoint and a
+# with a brainproxy CLI of 0.6.0 or later) plus the AWS CLI, jq, this folder's entrypoint and a
 # pinned rules bundle. Build from the repository root:
 #
 #   docker buildx build --platform linux/amd64 -f deploy/fargate-oneshot/Dockerfile \
